@@ -11,7 +11,7 @@ use crate::utils::{
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexSet;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use windows::core::{w, PCWSTR};
 use windows::Win32::{
     Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
@@ -53,6 +53,7 @@ pub struct App {
     startup: Startup,
     config: Config,
     switch_windows_state: SwitchWindowsState,
+    fixed_order_windows: HashMap<String, Vec<isize>>,
     switch_apps_state: Option<SwitchAppsState>,
     cached_icons: HashMap<String, HICON>,
     painter: GdiAAPainter,
@@ -86,6 +87,7 @@ impl App {
                 cache: None,
                 modifier_released: true,
             },
+            fixed_order_windows: Default::default(),
             switch_apps_state: None,
             cached_icons: Default::default(),
             painter,
@@ -189,6 +191,16 @@ impl App {
                 }
             }
         }
+    }
+
+    fn uses_fixed_window_order(&self, module_path: &str) -> bool {
+        let module_path = module_path.split("::").next().unwrap_or(module_path);
+        let exe = module_path
+            .rsplit('\\')
+            .next()
+            .unwrap_or(module_path)
+            .to_ascii_lowercase();
+        self.config.switch_windows_fixed_order.contains(&exe)
     }
 
     unsafe extern "system" fn window_proc(
@@ -319,15 +331,60 @@ impl App {
         match windows.get(&module_path) {
             None => Ok(false),
             Some(windows) => {
-                let windows_len = windows.len();
-                if windows_len == 1 {
+                let fixed_order = self.uses_fixed_window_order(&module_path);
+                let mut window_ids: Vec<isize> =
+                    windows.iter().map(|(id, _)| id.0 as isize).collect();
+
+                if fixed_order {
+                    let stable_order = self
+                        .fixed_order_windows
+                        .entry(module_path.clone())
+                        .or_default();
+                    merge_fixed_order(stable_order, &window_ids);
+                    if let Some(rotated) = rotate_fixed_order(stable_order, hwnd.0 as isize) {
+                        window_ids = rotated;
+                    }
+                }
+
+                let windows_len = window_ids.len();
+                if windows_len <= 1 {
                     return Ok(false);
                 }
-                let current_id = windows[0].0;
-                let mut index = 1;
+                let current_id = if fixed_order {
+                    HWND(window_ids[0] as _)
+                } else {
+                    windows[0].0
+                };
+                let mut index = if fixed_order && reverse {
+                    windows_len - 1
+                } else {
+                    1
+                };
                 let mut state_id = current_id;
                 let mut state_windows = vec![];
-                if windows_len > 2 {
+                if fixed_order {
+                    if let Some((cache_module_path, cache_id, cache_index, cache_windows)) =
+                        self.switch_windows_state.cache.as_ref()
+                    {
+                        if cache_module_path == &module_path
+                            && !self.switch_windows_state.modifier_released
+                        {
+                            state_id = *cache_id;
+                            state_windows =
+                                reconstruct_fixed_state_windows(cache_windows, &window_ids);
+                            index = match normalized_fixed_index(
+                                hwnd.0 as isize,
+                                *cache_index,
+                                cache_windows,
+                                &state_windows,
+                                reverse,
+                            ) {
+                                Some(index) => index,
+                                None => return Ok(false),
+                            };
+                        }
+                    }
+                } else if windows_len > 2 {
                     if let Some((cache_module_path, cache_id, cache_index, cache_windows)) =
                         self.switch_windows_state.cache.as_ref()
                     {
@@ -352,7 +409,7 @@ impl App {
                                 }
                                 state_windows.extend(windows_set);
                                 index = if reverse {
-                                    if *cache_index == 0 {
+                                    if *cache_index == 0 || *cache_index >= windows_len {
                                         windows_len - 1
                                     } else {
                                         cache_index - 1
@@ -367,7 +424,7 @@ impl App {
                     }
                 }
                 if state_windows.is_empty() {
-                    state_windows = windows.iter().map(|(v, _)| v.0 as _).collect();
+                    state_windows = window_ids.clone();
                 }
                 let hwnd = HWND(state_windows[index] as _);
                 self.switch_windows_state = SwitchWindowsState {
@@ -498,4 +555,147 @@ struct SwitchWindowsState {
 pub struct SwitchAppsState {
     pub apps: Vec<(HICON, HWND)>,
     pub index: usize,
+}
+
+fn merge_fixed_order(order: &mut Vec<isize>, visible: &[isize]) {
+    let visible_set: HashSet<isize> = visible.iter().copied().collect();
+    order.retain(|id| visible_set.contains(id));
+
+    for id in visible {
+        if !order.contains(id) {
+            order.push(*id);
+        }
+    }
+}
+
+fn rotate_fixed_order(order: &[isize], current: isize) -> Option<Vec<isize>> {
+    let start = order.iter().position(|id| *id == current)?;
+    let mut rotated = Vec::with_capacity(order.len());
+    rotated.extend_from_slice(&order[start..]);
+    rotated.extend_from_slice(&order[..start]);
+    Some(rotated)
+}
+
+fn reconstruct_fixed_state_windows(cache_windows: &[isize], window_ids: &[isize]) -> Vec<isize> {
+    let current_ids: HashSet<isize> = window_ids.iter().copied().collect();
+    let mut state_windows = cache_windows
+        .iter()
+        .copied()
+        .filter(|id| current_ids.contains(id))
+        .collect::<Vec<_>>();
+
+    for id in window_ids {
+        if !state_windows.contains(id) {
+            state_windows.push(*id);
+        }
+    }
+
+    state_windows
+}
+
+fn next_fixed_index(index: usize, len: usize, reverse: bool) -> usize {
+    if reverse {
+        if index == 0 {
+            len - 1
+        } else {
+            index - 1
+        }
+    } else if index >= len - 1 {
+        0
+    } else {
+        index + 1
+    }
+}
+
+fn normalized_fixed_index(
+    current: isize,
+    cache_index: usize,
+    cache_windows: &[isize],
+    state_windows: &[isize],
+    reverse: bool,
+) -> Option<usize> {
+    let len = state_windows.len();
+    if len < 2 {
+        return None;
+    }
+    let anchor = state_windows
+        .iter()
+        .position(|id| *id == current)
+        .or_else(|| {
+            cache_windows
+                .get(cache_index)
+                .and_then(|id| state_windows.iter().position(|current_id| current_id == id))
+        })
+        .unwrap_or(cache_index % len);
+    Some(next_fixed_index(anchor, len, reverse))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_fixed_order_keeps_existing_positions_and_appends_new_windows() {
+        let mut order = vec![1, 2, 3];
+
+        merge_fixed_order(&mut order, &[3, 1, 4]);
+
+        assert_eq!(order, vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn merge_fixed_order_removes_windows_not_in_current_group() {
+        let mut order = vec![1, 2, 3];
+
+        merge_fixed_order(&mut order, &[2, 3]);
+
+        assert_eq!(order, vec![2, 3]);
+    }
+
+    #[test]
+    fn rotate_fixed_order_starts_at_current_window() {
+        assert_eq!(rotate_fixed_order(&[1, 2, 3], 2), Some(vec![2, 3, 1]));
+    }
+
+    #[test]
+    fn rotate_fixed_order_returns_none_for_unknown_window() {
+        assert_eq!(rotate_fixed_order(&[1, 2, 3], 9), None);
+    }
+
+    #[test]
+    fn next_fixed_index_supports_forward_and_reverse_cycles() {
+        assert_eq!(next_fixed_index(0, 3, false), 1);
+        assert_eq!(next_fixed_index(2, 3, false), 0);
+        assert_eq!(next_fixed_index(0, 3, true), 2);
+        assert_eq!(next_fixed_index(2, 3, true), 1);
+    }
+
+    #[test]
+    fn fixed_state_windows_preserves_cached_order_and_appends_stable_new_windows() {
+        assert_eq!(
+            reconstruct_fixed_state_windows(&[4, 1], &[1, 2, 3, 4]),
+            vec![4, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn normalized_fixed_index_wraps_stale_indices_and_rejects_short_cycles() {
+        assert_eq!(
+            normalized_fixed_index(3, 2, &[1, 2, 3], &[2, 3], false),
+            Some(0)
+        );
+        assert_eq!(
+            normalized_fixed_index(3, 2, &[1, 2, 3], &[2, 3], true),
+            Some(0)
+        );
+        assert_eq!(
+            normalized_fixed_index(9, 2, &[1, 2, 3], &[2, 3], false),
+            Some(0)
+        );
+        assert_eq!(
+            normalized_fixed_index(9, 2, &[1, 2, 4], &[2, 3], false),
+            Some(1)
+        );
+        assert_eq!(normalized_fixed_index(1, 0, &[1], &[1], false), None);
+    }
 }
