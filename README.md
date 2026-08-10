@@ -50,6 +50,10 @@ hotkey = alt+`
 # e.g. game1.exe,game2.exe
 blacklist =
 
+# Use stable discovery order for windows of these processes, case-insensitive.
+# e.g. Code.exe,notepad.exe
+fixed_order =
+
 # Ignore minimal windows
 ignore_minimal = no
 
@@ -70,6 +74,8 @@ ignore_minimal = no
 # Only switch apps within the current virtual desktops: yes/no/auto
 only_current_desktop = auto
 ```
+
+`fixed_order` accepts comma-separated executable file names, such as `Code.exe,notepad.exe`. Matching is case-insensitive, and full paths are not supported. It affects same-application window switching only, not `Alt+Tab`. For each listed process, Window-Switcher establishes the order from the order in which it first observes windows during its current run. Newly observed windows append to the order, and windows that are closed then reopened append at the end. This provides a stable, taskbar-like approximation; it does not read the real Windows 11 taskbar order. Restart Window-Switcher after changing the configuration.
 
 ## Running as Administrator (Optional)
 

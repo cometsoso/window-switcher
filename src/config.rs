@@ -20,6 +20,7 @@ pub struct Config {
     pub log_file: Option<PathBuf>,
     pub switch_windows_hotkey: Vec<Hotkey>,
     pub switch_windows_blacklist: HashSet<String>,
+    pub switch_windows_fixed_order: HashSet<String>,
     pub switch_windows_ignore_minimal: bool,
     switch_windows_only_current_desktop: Option<bool>,
     pub switch_apps_enable: bool,
@@ -42,6 +43,7 @@ impl Default for Config {
             )
             .unwrap()],
             switch_windows_blacklist: Default::default(),
+            switch_windows_fixed_order: Default::default(),
             switch_windows_ignore_minimal: false,
             switch_windows_only_current_desktop: None,
             switch_apps_enable: false,
@@ -97,6 +99,13 @@ impl Config {
                 .map(|v| v.split(',').map(|v| v.trim().to_string()).collect())
             {
                 conf.switch_windows_blacklist = v;
+            }
+            if let Some(v) = section.get("fixed_order") {
+                conf.switch_windows_fixed_order = v
+                    .split(',')
+                    .map(|v| v.trim().to_ascii_lowercase())
+                    .filter(|v| !v.is_empty())
+                    .collect();
             }
             if let Some(v) = section.get("ignore_minimal").and_then(Config::to_bool) {
                 conf.switch_windows_ignore_minimal = v;
@@ -401,5 +410,37 @@ mod tests {
         assert_eq!(hotkeys.len(), 1);
         assert_eq!(hotkeys[0].modifier, [0x38, 0x38]);
         assert_eq!(hotkeys[0].code, 0x29);
+    }
+
+    #[test]
+    fn test_parse_fixed_order_processes() {
+        let ini = Ini::load_from_str(
+            "[switch-windows]\nfixed_order = Code.exe, notepad.exe, , CODE.EXE",
+        )
+        .unwrap();
+        let config = Config::load(&ini).unwrap();
+
+        assert_eq!(config.switch_windows_fixed_order.len(), 2);
+        assert!(config
+            .switch_windows_fixed_order
+            .contains("code.exe"));
+        assert!(config
+            .switch_windows_fixed_order
+            .contains("notepad.exe"));
+    }
+
+    #[test]
+    fn test_fixed_order_processes_default_to_empty() {
+        let missing = Ini::load_from_str("[switch-windows]\nignore_minimal = no").unwrap();
+        let empty = Ini::load_from_str("[switch-windows]\nfixed_order =").unwrap();
+
+        assert!(Config::load(&missing)
+            .unwrap()
+            .switch_windows_fixed_order
+            .is_empty());
+        assert!(Config::load(&empty)
+            .unwrap()
+            .switch_windows_fixed_order
+            .is_empty());
     }
 }
