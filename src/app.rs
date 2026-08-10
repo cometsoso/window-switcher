@@ -654,10 +654,7 @@ mod tests {
 
     #[test]
     fn rotate_fixed_order_starts_at_current_window() {
-        assert_eq!(
-            rotate_fixed_order(&[1, 2, 3], 2),
-            Some(vec![2, 3, 1])
-        );
+        assert_eq!(rotate_fixed_order(&[1, 2, 3], 2), Some(vec![2, 3, 1]));
     }
 
     #[test]

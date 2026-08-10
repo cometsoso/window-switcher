@@ -414,19 +414,14 @@ mod tests {
 
     #[test]
     fn test_parse_fixed_order_processes() {
-        let ini = Ini::load_from_str(
-            "[switch-windows]\nfixed_order = Code.exe, notepad.exe, , CODE.EXE",
-        )
-        .unwrap();
+        let ini =
+            Ini::load_from_str("[switch-windows]\nfixed_order = Code.exe, notepad.exe, , CODE.EXE")
+                .unwrap();
         let config = Config::load(&ini).unwrap();
 
         assert_eq!(config.switch_windows_fixed_order.len(), 2);
-        assert!(config
-            .switch_windows_fixed_order
-            .contains("code.exe"));
-        assert!(config
-            .switch_windows_fixed_order
-            .contains("notepad.exe"));
+        assert!(config.switch_windows_fixed_order.contains("code.exe"));
+        assert!(config.switch_windows_fixed_order.contains("notepad.exe"));
     }
 
     #[test]
