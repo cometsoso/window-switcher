@@ -1187,8 +1187,7 @@ fn get_icon_bounds(hicon: HICON) -> Option<IconBounds> {
         if !has_semi_transparent
             && (max_x < 0
                 || (min_x == 0 && min_y == 0 && max_x == width - 1 && max_y == height - 1))
-        {
-            if 0 != GetDIBits(
+            && 0 != GetDIBits(
                 mem_dc,
                 icon_info.hbmMask,
                 0,
@@ -1196,17 +1195,17 @@ fn get_icon_bounds(hicon: HICON) -> Option<IconBounds> {
                 Some(pixels.as_mut_ptr() as *mut _),
                 &mut bmi,
                 DIB_RGB_COLORS,
-            ) {
-                let visible = pixels
-                    .chunks_exact(4)
-                    .map(|c| c[0] == 0 && c[1] == 0 && c[2] == 0)
-                    .collect::<Vec<_>>();
-                if let Some(bounds) = mask_bounds(width, height, &visible) {
-                    min_x = bounds.min_x;
-                    min_y = bounds.min_y;
-                    max_x = bounds.max_x;
-                    max_y = bounds.max_y;
-                }
+            )
+        {
+            let visible = pixels
+                .chunks_exact(4)
+                .map(|c| c[0] == 0 && c[1] == 0 && c[2] == 0)
+                .collect::<Vec<_>>();
+            if let Some(bounds) = mask_bounds(width, height, &visible) {
+                min_x = bounds.min_x;
+                min_y = bounds.min_y;
+                max_x = bounds.max_x;
+                max_y = bounds.max_y;
             }
         }
 
