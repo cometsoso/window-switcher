@@ -169,8 +169,7 @@ pub(crate) fn normalized_hicon_rect(
     y: i32,
     target_size: i32,
 ) -> (i32, i32, i32, i32) {
-    let (x, y, width, height) =
-        normalized_canvas_rect(candidate, x as f32, y as f32, target_size);
+    let (x, y, width, height) = normalized_canvas_rect(candidate, x as f32, y as f32, target_size);
     (
         x.round() as i32,
         y.round() as i32,
@@ -377,8 +376,9 @@ impl AppIcon {
 
     pub fn selected(&self, target_size: i32) -> Option<&IconCandidate> {
         let target_size = target_size.max(1);
-        let desired_visible_size =
-            (target_size as f32 * VISIBLE_CONTENT_PERCENT).round().max(1.0) as i32;
+        let desired_visible_size = (target_size as f32 * VISIBLE_CONTENT_PERCENT)
+            .round()
+            .max(1.0) as i32;
         self.candidates
             .iter()
             .filter(|candidate| {
@@ -1267,10 +1267,7 @@ mod tests {
         let all_black = [true; 16];
         let all_white = [false; 16];
 
-        assert_eq!(
-            mask_bounds(4, 4, &all_black),
-            Some(PixelBounds::full(4, 4))
-        );
+        assert_eq!(mask_bounds(4, 4, &all_black), Some(PixelBounds::full(4, 4)));
         assert_eq!(mask_bounds(4, 4, &all_white), None);
         assert_eq!(
             select_bounds(None, None, 4, 4, &[0; 64]),
@@ -1315,19 +1312,23 @@ mod tests {
         }
 
         assert_eq!(icon.selected(64).map(|candidate| candidate.width), Some(48));
-        assert_eq!(icon.selected(128).map(|candidate| candidate.width), Some(256));
+        assert_eq!(
+            icon.selected(128).map(|candidate| candidate.width),
+            Some(256)
+        );
     }
 
     #[test]
     fn ico_dimensions_contain_only_native_unique_frames() {
         let mut data = vec![0, 0, 1, 0, 3, 0];
         for (width, height) in [(0, 0), (48, 48), (48, 48)] {
-            data.extend_from_slice(&[
-                width, height, 0, 0, 1, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            ]);
+            data.extend_from_slice(&[width, height, 0, 0, 1, 0, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         }
 
-        assert_eq!(ico_frame_dimensions(&data), Some(vec![(256, 256), (48, 48)]));
+        assert_eq!(
+            ico_frame_dimensions(&data),
+            Some(vec![(256, 256), (48, 48)])
+        );
         assert_eq!(ico_frame_dimensions(&data[..data.len() - 1]), None);
     }
 
@@ -1336,9 +1337,7 @@ mod tests {
         use windows::Win32::Graphics::GdiPlus::{
             GdiplusShutdown, GdiplusStartup, GdiplusStartupInput,
         };
-        use windows::Win32::UI::WindowsAndMessaging::{
-            CopyIcon, LoadIconW, IDI_APPLICATION,
-        };
+        use windows::Win32::UI::WindowsAndMessaging::{CopyIcon, LoadIconW, IDI_APPLICATION};
 
         unsafe {
             let startup_input = GdiplusStartupInput {
@@ -1367,18 +1366,8 @@ mod tests {
 
         let and_mask = [0xc0, 0x00];
         let xor_mask = [0x40, 0x00];
-        let icon = unsafe {
-            CreateIcon(
-                None,
-                2,
-                1,
-                1,
-                1,
-                and_mask.as_ptr(),
-                xor_mask.as_ptr(),
-            )
-        }
-        .unwrap();
+        let icon =
+            unsafe { CreateIcon(None, 2, 1, 1, 1, and_mask.as_ptr(), xor_mask.as_ptr()) }.unwrap();
 
         let bounds = get_icon_bounds(icon).unwrap();
 
