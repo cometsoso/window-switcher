@@ -5,7 +5,10 @@ use indexmap::IndexMap;
 use std::{ffi::c_void, mem::size_of, path::PathBuf};
 use windows::core::{BOOL, PCWSTR, PWSTR};
 use windows::Win32::{
-    Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, HWND, LPARAM, MAX_PATH, POINT, RECT},
+    Foundation::{
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, FILETIME, HWND, LPARAM, MAX_PATH,
+        POINT, RECT,
+    },
     Graphics::{
         Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWM_CLOAKED_SHELL},
         Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST},
@@ -17,7 +20,7 @@ use windows::Win32::{
     System::{
         LibraryLoader::GetModuleFileNameW,
         Threading::{
-            OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+            GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
             PROCESS_QUERY_LIMITED_INFORMATION,
         },
     },
@@ -120,6 +123,25 @@ pub fn get_window_pid(hwnd: HWND) -> u32 {
     let mut pid: u32 = 0;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32)) };
     pid
+}
+
+pub fn get_process_start_time(hwnd: HWND) -> Option<u64> {
+    let pid = get_window_pid(hwnd);
+    if pid == 0 {
+        return None;
+    }
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let result =
+        unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    result.ok()?;
+    Some((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
 }
 
 pub fn get_module_path(pid: u32) -> Option<String> {

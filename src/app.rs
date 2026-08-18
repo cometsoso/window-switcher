@@ -5,24 +5,28 @@ use crate::painter::GdiAAPainter;
 use crate::startup::Startup;
 use crate::trayicon::TrayIcon;
 use crate::utils::{
-    check_error, get_app_icon, get_foreground_window, get_window_user_data, is_iconic_window,
-    is_running_as_admin, list_windows, set_foreground_window, set_window_user_data,
+    check_error, get_app_icon, get_foreground_window, get_process_start_time, get_window_user_data,
+    is_iconic_window, is_running_as_admin, list_windows, set_foreground_window,
+    set_window_user_data, AppIcon,
 };
 
 use anyhow::{anyhow, Result};
 use indexmap::IndexSet;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 use windows::core::{w, PCWSTR};
 use windows::Win32::{
     Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyIcon, DispatchMessageW, GetMessageW,
-        GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
-        RegisterWindowMessageW, SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-        CW_USEDEFAULT, GWL_STYLE, HICON, HTCLIENT, IDC_ARROW, MSG, WINDOW_STYLE, WM_COMMAND,
-        WM_ERASEBKGND, WM_LBUTTONUP, WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW, WS_CAPTION,
-        WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
+        LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
+        SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_STYLE,
+        HTCLIENT, IDC_ARROW, MSG, WINDOW_STYLE, WM_COMMAND, WM_ERASEBKGND, WM_LBUTTONUP,
+        WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+        WS_EX_TOPMOST,
     },
 };
 
@@ -55,7 +59,7 @@ pub struct App {
     switch_windows_state: SwitchWindowsState,
     fixed_order_windows: HashMap<String, Vec<isize>>,
     switch_apps_state: Option<SwitchAppsState>,
-    cached_icons: HashMap<String, HICON>,
+    cached_icons: HashMap<String, CachedAppIcon>,
     painter: GdiAAPainter,
 }
 
@@ -303,6 +307,10 @@ impl App {
             }
             _ if msg == WM_USER_REGISTER_TRAYICON || unsafe { msg == WM_TASKBARCREATED } => {
                 let app = get_app(hwnd)?;
+                if msg == unsafe { WM_TASKBARCREATED } {
+                    app.cancel_switch_app();
+                    app.cached_icons.clear();
+                }
                 app.set_trayicon();
             }
             _ => {}
@@ -470,17 +478,38 @@ impl App {
             } else {
                 hwnds[0].0
             };
-            let module_hicon = self
-                .cached_icons
-                .entry(module_path.clone())
-                .or_insert_with(|| {
-                    get_app_icon(
-                        &self.config.switch_apps_override_icons,
-                        module_path,
-                        module_hwnd,
-                    )
+            let identities = hwnds
+                .iter()
+                .map(|(hwnd, _)| get_process_start_time(*hwnd))
+                .collect::<Option<Vec<_>>>()
+                .map(|mut identities| {
+                    identities.sort_unstable();
+                    identities.dedup();
+                    identities
                 });
-            apps.push((*module_hicon, module_hwnd));
+            let icon = self
+                .cached_icons
+                .get(module_path)
+                .filter(|cached| {
+                    identities.is_some() && cached.identities.as_ref() == identities.as_ref()
+                })
+                .map(|cached| Rc::clone(&cached.icon));
+            let icon = icon.unwrap_or_else(|| {
+                let icon = Rc::new(get_app_icon(
+                    &self.config.switch_apps_override_icons,
+                    module_path,
+                    module_hwnd,
+                ));
+                self.cached_icons.insert(
+                    module_path.clone(),
+                    CachedAppIcon {
+                        icon: Rc::clone(&icon),
+                        identities,
+                    },
+                );
+                icon
+            });
+            apps.push((icon, module_hwnd));
         }
         let num_apps = apps.len() as i32;
         if num_apps == 0 {
@@ -528,11 +557,7 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
-        for (_, icon) in self.cached_icons.drain() {
-            unsafe {
-                let _ = DestroyIcon(icon);
-            }
-        }
+        self.cached_icons.clear();
     }
 }
 
@@ -553,8 +578,13 @@ struct SwitchWindowsState {
 
 #[derive(Debug)]
 pub struct SwitchAppsState {
-    pub apps: Vec<(HICON, HWND)>,
+    pub apps: Vec<(Rc<AppIcon>, HWND)>,
     pub index: usize,
+}
+
+struct CachedAppIcon {
+    icon: Rc<AppIcon>,
+    identities: Option<Vec<u64>>,
 }
 
 fn merge_fixed_order(order: &mut Vec<isize>, visible: &[isize]) {

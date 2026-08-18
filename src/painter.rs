@@ -1,24 +1,27 @@
 use crate::app::SwitchAppsState;
-use crate::utils::{check_error, get_moinitor_rect, is_light_theme, is_win11};
+use crate::utils::{
+    check_error, draw_normalized_icon, get_moinitor_rect, is_light_theme, is_win11,
+    normalized_hicon_rect,
+};
 
 use anyhow::{Context, Result};
+use std::ffi::c_void;
 use windows::Win32::{
     Foundation::{COLORREF, HWND, POINT, RECT, SIZE},
     Graphics::{
         Gdi::{
-            CreateCompatibleBitmap, CreateCompatibleDC, CreateRoundRectRgn, CreateSolidBrush,
+            BitBlt, CreateCompatibleDC, CreateDIBSection, CreateRoundRectRgn, CreateSolidBrush,
             DeleteDC, DeleteObject, FillRect, FillRgn, GetDC, ReleaseDC, SelectObject,
-            SetStretchBltMode, StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION, HALFTONE,
-            HBITMAP, HDC, HPALETTE, SRCCOPY,
+            SetStretchBltMode, StretchBlt, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER,
+            BLENDFUNCTION, DIB_RGB_COLORS, HALFTONE, HBITMAP, HDC, RGBQUAD, SRCCOPY,
         },
         GdiPlus::{
-            FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateBitmapFromHBITMAP,
-            GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1, GdipDeleteBrush, GdipDeleteGraphics,
-            GdipDeletePath, GdipDeletePen, GdipDisposeImage, GdipDrawImageRect, GdipFillPath,
-            GdipFillRectangle, GdipGetPenBrushFill, GdipSetInterpolationMode, GdipSetSmoothingMode,
-            GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBitmap, GpBrush, GpGraphics,
-            GpImage, GpPath, GpPen, InterpolationModeHighQualityBicubic, SmoothingModeAntiAlias,
-            Unit,
+            FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateFromHDC,
+            GdipCreatePath, GdipCreatePen1, GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath,
+            GdipDeletePen, GdipFillPath, GdipFillRectangle, GdipGetPenBrushFill,
+            GdipSetInterpolationMode, GdipSetSmoothingMode, GdiplusShutdown, GdiplusStartup,
+            GdiplusStartupInput, GpBrush, GpGraphics, GpPath, GpPen,
+            InterpolationModeHighQualityBicubic, SmoothingModeAntiAlias, Unit,
         },
     },
     UI::{
@@ -40,6 +43,45 @@ pub const ICON_SIZE_BASE: i32 = 64;
 pub const WINDOW_BORDER_SIZE_BASE: i32 = 10;
 pub const ICON_BORDER_SIZE_BASE: i32 = 4;
 pub const SCALE_FACTOR: i32 = 6;
+
+unsafe fn create_top_down_dib(hdc: HDC, width: i32, height: i32) -> Option<(HBITMAP, *mut u8)> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let bitmap_info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: 0,
+            ..Default::default()
+        },
+        bmiColors: [RGBQUAD::default()],
+    };
+    let mut bits = std::ptr::null_mut::<c_void>();
+    let bitmap =
+        CreateDIBSection(Some(hdc), &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+    if bits.is_null() {
+        let _ = DeleteObject(bitmap.into());
+        return None;
+    }
+    std::slice::from_raw_parts_mut(bits.cast::<u8>(), (width * height * 4) as usize).fill(0);
+    Some((bitmap, bits.cast()))
+}
+
+fn make_surface_opaque(bits: *mut u8, width: i32, height: i32) {
+    if bits.is_null() || width <= 0 || height <= 0 {
+        return;
+    }
+    unsafe {
+        let pixels = std::slice::from_raw_parts_mut(bits, (width * height * 4) as usize);
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel[3] = u8::MAX;
+        }
+    }
+}
 
 // GDI Antialiasing Painter
 pub struct GdiAAPainter {
@@ -105,7 +147,11 @@ impl GdiAAPainter {
 
         unsafe {
             let hdc_mem = CreateCompatibleDC(Some(hdc_screen));
-            let bitmap_mem = CreateCompatibleBitmap(hdc_screen, width, height);
+            let Some((bitmap_mem, _bits_mem)) = create_top_down_dib(hdc_screen, width, height)
+            else {
+                let _ = DeleteDC(hdc_mem);
+                return;
+            };
             SelectObject(hdc_mem, bitmap_mem.into());
 
             let mut graphics = GpGraphics::default();
@@ -142,6 +188,9 @@ impl GdiAAPainter {
                     height as f32,
                 );
             }
+            GdipDeleteBrush(bg_brush_ptr);
+            GdipDeletePen(bg_pen_ptr);
+            GdipDeleteGraphics(graphics_ptr);
 
             let icons_width = item_size * state.apps.len() as i32;
             let icons_height = item_size;
@@ -156,20 +205,26 @@ impl GdiAAPainter {
                 fg_color,
                 bg_color,
             );
+            if bitmap_icons.is_invalid() {
+                let _ = DeleteDC(hdc_mem);
+                let _ = DeleteObject(bitmap_mem.into());
+                return;
+            }
 
-            let mut bitmap = GpBitmap::default();
-            let mut bitmap_ptr: *mut GpBitmap = &mut bitmap as _;
-            GdipCreateBitmapFromHBITMAP(bitmap_icons, HPALETTE::default(), &mut bitmap_ptr as _);
-
-            let image_ptr: *mut GpImage = bitmap_ptr as *mut GpImage;
-            GdipDrawImageRect(
-                graphics_ptr,
-                image_ptr,
-                border_size as f32,
-                border_size as f32,
-                icons_width as f32,
-                icons_height as f32,
+            let hdc_icons = CreateCompatibleDC(Some(hdc_screen));
+            SelectObject(hdc_icons, bitmap_icons.into());
+            let _ = BitBlt(
+                hdc_mem,
+                border_size,
+                border_size,
+                icons_width,
+                icons_height,
+                Some(hdc_icons),
+                0,
+                0,
+                SRCCOPY,
             );
+            let _ = DeleteDC(hdc_icons);
 
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as _,
@@ -192,14 +247,9 @@ impl GdiAAPainter {
                 ULW_ALPHA,
             );
 
-            GdipDisposeImage(image_ptr);
-            GdipDeleteBrush(bg_brush_ptr);
-            GdipDeletePen(bg_pen_ptr);
-            GdipDeleteGraphics(graphics_ptr);
-
+            let _ = DeleteDC(hdc_mem);
             let _ = DeleteObject(bitmap_icons.into());
             let _ = DeleteObject(bitmap_mem.into());
-            let _ = DeleteDC(hdc_mem);
         }
 
         if self.show {
@@ -346,15 +396,31 @@ fn draw_icons(
 
     unsafe {
         let hdc_tmp = CreateCompatibleDC(Some(hdc_screen));
-        let bitmap_tmp = CreateCompatibleBitmap(hdc_screen, width, height);
+        let Some((bitmap_tmp, bits_tmp)) = create_top_down_dib(hdc_screen, width, height) else {
+            let _ = DeleteDC(hdc_tmp);
+            return HBITMAP::default();
+        };
         SelectObject(hdc_tmp, bitmap_tmp.into());
 
         let hdc_scaled = CreateCompatibleDC(Some(hdc_screen));
-        let bitmap_scaled = CreateCompatibleBitmap(hdc_screen, scaled_width, scaled_height);
+        let Some((bitmap_scaled, _bits_scaled)) =
+            create_top_down_dib(hdc_screen, scaled_width, scaled_height)
+        else {
+            let _ = DeleteDC(hdc_tmp);
+            let _ = DeleteObject(bitmap_tmp.into());
+            let _ = DeleteDC(hdc_scaled);
+            return HBITMAP::default();
+        };
         SelectObject(hdc_scaled, bitmap_scaled.into());
 
         let fg_brush = CreateSolidBrush(COLORREF(fg_color));
         let bg_brush = CreateSolidBrush(COLORREF(bg_color));
+
+        let mut icon_graphics_ptr: *mut GpGraphics = std::ptr::null_mut();
+        let icon_graphics_ready = GdipCreateFromHDC(hdc_scaled, &mut icon_graphics_ptr as _).0 == 0;
+        if icon_graphics_ready {
+            GdipSetInterpolationMode(icon_graphics_ptr, InterpolationModeHighQualityBicubic);
+        }
 
         let rect = RECT {
             left: 0,
@@ -384,18 +450,44 @@ fn draw_icons(
                 let _ = DeleteObject(rgn.into());
             }
 
-            let cx = scaled_border_size + scaled_icon_outer_size * (i as i32);
-            let _ = DrawIconEx(
-                hdc_scaled,
-                cx,
-                scaled_border_size,
-                *icon,
-                scaled_icon_inner_size,
-                scaled_icon_inner_size,
-                0,
-                None,
-                DI_NORMAL,
-            );
+            let Some(candidate) = icon.selected(scaled_icon_inner_size) else {
+                continue;
+            };
+            let cx = scaled_border_size + scaled_icon_outer_size * i as i32;
+            let normalized = icon_graphics_ready
+                && candidate.has_bitmap()
+                && draw_normalized_icon(
+                    icon_graphics_ptr,
+                    candidate,
+                    cx as f32,
+                    scaled_border_size as f32,
+                    scaled_icon_inner_size,
+                );
+            if !normalized {
+                if candidate.has_bitmap() {
+                    debug!("normalized app icon failed at index {i}, using direct DrawIconEx");
+                }
+                let (x, y, width, height) = normalized_hicon_rect(
+                    candidate,
+                    cx,
+                    scaled_border_size,
+                    scaled_icon_inner_size,
+                );
+                let _ = DrawIconEx(
+                    hdc_scaled,
+                    x,
+                    y,
+                    candidate.hicon,
+                    width,
+                    height,
+                    0,
+                    None,
+                    DI_NORMAL,
+                );
+            }
+        }
+        if icon_graphics_ready {
+            GdipDeleteGraphics(icon_graphics_ptr);
         }
 
         SetStretchBltMode(hdc_tmp, HALFTONE);
@@ -412,11 +504,12 @@ fn draw_icons(
             scaled_height,
             SRCCOPY,
         );
+        make_surface_opaque(bits_tmp, width, height);
 
         let _ = DeleteObject(fg_brush.into());
         let _ = DeleteObject(bg_brush.into());
-        let _ = DeleteObject(bitmap_scaled.into());
         let _ = DeleteDC(hdc_scaled);
+        let _ = DeleteObject(bitmap_scaled.into());
         let _ = DeleteDC(hdc_tmp);
 
         bitmap_tmp
@@ -449,8 +542,13 @@ impl Coordinate {
         let monitor_width = monitor_rect.right - monitor_rect.left;
         let monitor_height = monitor_rect.bottom - monitor_rect.top;
 
-        let icon_size =
-            ((monitor_width - 2 * border_size) / num_apps - icon_border * 2).min(icon_size_max);
+        let available_icon_size = (monitor_width - 2 * border_size) / num_apps - icon_border * 2;
+        let min_icon_size = (32.0 * (icon_size_max as f64 / ICON_SIZE_BASE as f64)) as i32;
+        let icon_size = if available_icon_size >= min_icon_size {
+            available_icon_size.min(icon_size_max)
+        } else {
+            available_icon_size.max(1)
+        };
 
         let item_size = icon_size + icon_border * 2;
         let width = item_size * num_apps + border_size * 2;
@@ -465,6 +563,51 @@ impl Coordinate {
             height,
             icon_size,
             item_size,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gdiplus_hdc_surface_uses_premultiplied_alpha() {
+        unsafe {
+            let startup_input = GdiplusStartupInput {
+                GdiplusVersion: 1,
+                ..Default::default()
+            };
+            let mut token = 0;
+            assert_eq!(
+                GdiplusStartup(&mut token, &startup_input, std::ptr::null_mut()).0,
+                0
+            );
+
+            let screen_dc = GetDC(None);
+            let memory_dc = CreateCompatibleDC(Some(screen_dc));
+            let (bitmap, bits) = create_top_down_dib(screen_dc, 1, 1).unwrap();
+            SelectObject(memory_dc, bitmap.into());
+
+            let mut graphics = std::ptr::null_mut();
+            assert_eq!(GdipCreateFromHDC(memory_dc, &mut graphics).0, 0);
+            let mut pen = std::ptr::null_mut();
+            assert_eq!(GdipCreatePen1(0x80ff0000, 0.0, Unit(0), &mut pen).0, 0);
+            let mut brush = std::ptr::null_mut();
+            assert_eq!(GdipGetPenBrushFill(pen, &mut brush).0, 0);
+            assert_eq!(GdipFillRectangle(graphics, brush, 0.0, 0.0, 1.0, 1.0).0, 0);
+
+            GdipDeleteBrush(brush);
+            GdipDeletePen(pen);
+            GdipDeleteGraphics(graphics);
+
+            let pixel = std::slice::from_raw_parts(bits, 4);
+            assert_eq!(pixel, [0, 0, 128, 128]);
+
+            let _ = DeleteDC(memory_dc);
+            let _ = DeleteObject(bitmap.into());
+            let _ = ReleaseDC(None, screen_dc);
+            GdiplusShutdown(token);
         }
     }
 }
