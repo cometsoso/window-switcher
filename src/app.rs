@@ -18,15 +18,19 @@ use std::{
 };
 use windows::core::{w, PCWSTR};
 use windows::Win32::{
-    Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM},
+    Foundation::{GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM},
     System::LibraryLoader::GetModuleHandleW,
-    UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowLongPtrW,
-        LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
-        SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_STYLE,
-        HTCLIENT, IDC_ARROW, MSG, WINDOW_STYLE, WM_COMMAND, WM_ERASEBKGND, WM_LBUTTONUP,
-        WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-        WS_EX_TOPMOST,
+    UI::{
+        Controls::WM_MOUSELEAVE,
+        Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT},
+        WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW,
+            GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
+            RegisterWindowMessageW, SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+            CW_USEDEFAULT, GWL_STYLE, HTCLIENT, IDC_ARROW, MSG, WINDOW_STYLE, WM_COMMAND,
+            WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW,
+            WS_CAPTION, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        },
     },
 };
 
@@ -238,9 +242,13 @@ impl App {
                 debug!("message WM_USER_SWITCH_APPS");
                 let app = get_app(hwnd)?;
                 let reverse = lparam.0 == 1;
+                let starting = app.switch_apps_state.is_none();
                 app.switch_apps(reverse)?;
                 if let Some(state) = &app.switch_apps_state {
                     app.painter.paint(state);
+                }
+                if starting {
+                    app.reset_pointer_position();
                 }
             }
             WM_USER_SWITCH_APPS_DONE => {
@@ -260,7 +268,7 @@ impl App {
                 let hwnd = app
                     .switch_apps_state
                     .as_ref()
-                    .and_then(|state| state.apps.get(state.index).map(|(_, id)| *id))
+                    .and_then(|state| state.apps.get(state.keyboard_index()).map(|(_, id)| *id))
                     .unwrap_or_else(get_foreground_window);
                 app.switch_windows(hwnd, reverse)?;
                 app.cancel_switch_app();
@@ -275,7 +283,15 @@ impl App {
             }
             WM_LBUTTONUP => {
                 let app = get_app(hwnd)?;
-                app.click();
+                app.click(lparam);
+            }
+            WM_MOUSEMOVE => {
+                let app = get_app(hwnd)?;
+                app.hover(lparam);
+            }
+            WM_MOUSELEAVE => {
+                let app = get_app(hwnd)?;
+                app.clear_hover();
             }
             WM_COMMAND => {
                 let value = wparam.0 as u32;
@@ -452,18 +468,12 @@ impl App {
             self.switch_apps_state
         );
         if let Some(state) = self.switch_apps_state.as_mut() {
-            if reverse {
-                if state.index == 0 {
-                    state.index = state.apps.len() - 1;
-                } else {
-                    state.index -= 1;
-                }
-            } else if state.index == state.apps.len() - 1 {
-                state.index = 0;
-            } else {
-                state.index += 1;
-            };
-            debug!("switch apps: new index:{}", state.index);
+            let mut pointer_position = POINT::default();
+            unsafe {
+                let _ = GetCursorPos(&mut pointer_position);
+            }
+            state.navigate(reverse, (pointer_position.x, pointer_position.y));
+            debug!("switch apps: new index:{}", state.keyboard_index());
             return Ok(());
         }
         let windows = list_windows(
@@ -524,24 +534,89 @@ impl App {
             1
         };
 
-        let state = SwitchAppsState { apps, index };
+        let mut pointer_position = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pointer_position);
+        }
+        let state = SwitchAppsState {
+            apps,
+            interaction: SwitchAppsInteractionState::new(
+                index,
+                (pointer_position.x, pointer_position.y),
+            ),
+        };
         self.switch_apps_state = Some(state);
         debug!("switch apps, new state:{:?}", self.switch_apps_state);
         Ok(())
     }
 
-    fn click(&mut self) {
+    fn click(&mut self, lparam: LPARAM) {
+        let pointer_position = client_pointer_position(lparam);
+        let clicked_index = self.switch_apps_state.as_ref().and_then(|state| {
+            self.painter
+                .find_app_index_at_client(state, pointer_position)
+        });
+        if let Some(index) = clicked_index {
+            self.do_switch_app_at(index);
+        }
+    }
+
+    fn hover(&mut self, lparam: LPARAM) {
+        let Some(state) = self.switch_apps_state.as_mut() else {
+            return;
+        };
+        let client_position = client_pointer_position(lparam);
+        let mut pointer_position = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pointer_position);
+            let mut tracking = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: self.hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut tracking);
+        }
+        let hovered_index = self
+            .painter
+            .find_app_index_at_client(state, client_position);
+        if state.update_hover((pointer_position.x, pointer_position.y), hovered_index) {
+            self.painter.paint(state);
+        }
+    }
+
+    fn clear_hover(&mut self) {
         if let Some(state) = self.switch_apps_state.as_mut() {
-            if let Some(i) = self.painter.find_clicked_app_index(state) {
-                state.index = i;
-                self.do_switch_app();
+            if state.clear_hover() {
+                self.painter.paint(state);
             }
         }
     }
 
+    fn reset_pointer_position(&mut self) {
+        let Some(state) = self.switch_apps_state.as_mut() else {
+            return;
+        };
+        let mut pointer_position = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pointer_position);
+        }
+        state.reset_pointer_position((pointer_position.x, pointer_position.y));
+    }
+
     fn do_switch_app(&mut self) {
+        let index = self
+            .switch_apps_state
+            .as_ref()
+            .map(SwitchAppsState::keyboard_index);
+        if let Some(index) = index {
+            self.do_switch_app_at(index);
+        }
+    }
+
+    fn do_switch_app_at(&mut self, index: usize) {
         if let Some(state) = self.switch_apps_state.take() {
-            if let Some((_, id)) = state.apps.get(state.index) {
+            if let Some((_, id)) = state.apps.get(index) {
                 set_foreground_window(*id);
             }
             self.painter.unpaint(state);
@@ -570,6 +645,14 @@ fn get_app(hwnd: HWND) -> Result<&'static mut App> {
     }
 }
 
+fn client_pointer_position(lparam: LPARAM) -> (i32, i32) {
+    let packed = lparam.0 as u32;
+    (
+        packed as u16 as i16 as i32,
+        (packed >> 16) as u16 as i16 as i32,
+    )
+}
+
 #[derive(Debug)]
 struct SwitchWindowsState {
     cache: Option<(String, HWND, usize, Vec<isize>)>,
@@ -579,7 +662,109 @@ struct SwitchWindowsState {
 #[derive(Debug)]
 pub struct SwitchAppsState {
     pub apps: Vec<(Rc<AppIcon>, HWND)>,
-    pub index: usize,
+    interaction: SwitchAppsInteractionState,
+}
+
+impl SwitchAppsState {
+    pub fn displayed_index(&self) -> usize {
+        self.interaction.displayed_index()
+    }
+
+    fn keyboard_index(&self) -> usize {
+        self.interaction.keyboard_index()
+    }
+
+    fn navigate(&mut self, reverse: bool, pointer_position: (i32, i32)) {
+        self.interaction
+            .navigate(self.apps.len(), reverse, pointer_position);
+    }
+
+    fn update_hover(&mut self, pointer_position: (i32, i32), hovered_index: Option<usize>) -> bool {
+        self.interaction
+            .update_hover(pointer_position, hovered_index)
+    }
+
+    fn clear_hover(&mut self) -> bool {
+        self.interaction.clear_hover()
+    }
+
+    fn reset_pointer_position(&mut self, pointer_position: (i32, i32)) {
+        self.interaction.reset_pointer_position(pointer_position);
+    }
+}
+
+#[derive(Debug)]
+struct SwitchAppsInteractionState {
+    keyboard_index: usize,
+    hovered_index: Option<usize>,
+    pointer_position: (i32, i32),
+}
+
+impl SwitchAppsInteractionState {
+    fn new(keyboard_index: usize, pointer_position: (i32, i32)) -> Self {
+        Self {
+            keyboard_index,
+            hovered_index: None,
+            pointer_position,
+        }
+    }
+
+    fn keyboard_index(&self) -> usize {
+        self.keyboard_index
+    }
+
+    fn hovered_index(&self) -> Option<usize> {
+        self.hovered_index
+    }
+
+    fn displayed_index(&self) -> usize {
+        self.hovered_index.unwrap_or(self.keyboard_index)
+    }
+
+    fn update_hover(&mut self, pointer_position: (i32, i32), hovered_index: Option<usize>) -> bool {
+        if self.pointer_position == pointer_position {
+            return false;
+        }
+        self.pointer_position = pointer_position;
+        if self.hovered_index == hovered_index {
+            return false;
+        }
+        self.hovered_index = hovered_index;
+        true
+    }
+
+    fn clear_hover(&mut self) -> bool {
+        if self.hovered_index().is_none() {
+            return false;
+        }
+        self.hovered_index = None;
+        true
+    }
+
+    fn reset_pointer_position(&mut self, pointer_position: (i32, i32)) {
+        self.pointer_position = pointer_position;
+        self.hovered_index = None;
+    }
+
+    fn navigate(&mut self, app_count: usize, reverse: bool, pointer_position: (i32, i32)) {
+        self.pointer_position = pointer_position;
+        if app_count == 0 {
+            self.hovered_index = None;
+            return;
+        }
+        self.keyboard_index = if reverse {
+            if self.keyboard_index == 0 {
+                app_count - 1
+            } else {
+                self.keyboard_index - 1
+            }
+        } else if self.keyboard_index >= app_count - 1 {
+            0
+        } else {
+            self.keyboard_index + 1
+        };
+        self.hovered_index = None;
+    }
 }
 
 struct CachedAppIcon {
@@ -663,6 +848,114 @@ fn normalized_fixed_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_switch_interaction_starts_without_hover() {
+        let state = SwitchAppsInteractionState::new(1, (10, 20));
+
+        assert_eq!(state.keyboard_index(), 1);
+        assert_eq!(state.hovered_index(), None);
+        assert_eq!(state.displayed_index(), 1);
+    }
+
+    #[test]
+    fn app_switch_hover_changes_display_without_changing_keyboard_index() {
+        let mut state = SwitchAppsInteractionState::new(1, (10, 20));
+
+        assert!(state.update_hover((11, 20), Some(4)));
+        assert_eq!(state.keyboard_index(), 1);
+        assert_eq!(state.hovered_index(), Some(4));
+        assert_eq!(state.displayed_index(), 4);
+        assert!(!state.update_hover((11, 20), Some(2)));
+    }
+
+    #[test]
+    fn app_switch_forward_navigation_continues_from_keyboard_index() {
+        let mut state = SwitchAppsInteractionState::new(1, (10, 20));
+        state.update_hover((11, 20), Some(4));
+
+        state.navigate(5, false, (11, 20));
+
+        assert_eq!(state.keyboard_index(), 2);
+        assert_eq!(state.hovered_index(), None);
+        assert_eq!(state.displayed_index(), 2);
+    }
+
+    #[test]
+    fn app_switch_pointer_movement_restores_hover_after_keyboard_navigation() {
+        let mut state = SwitchAppsInteractionState::new(1, (10, 20));
+        state.update_hover((11, 20), Some(4));
+        state.navigate(5, false, (11, 20));
+
+        assert!(state.update_hover((12, 20), Some(4)));
+        assert_eq!(state.keyboard_index(), 2);
+        assert_eq!(state.hovered_index(), Some(4));
+        assert_eq!(state.displayed_index(), 4);
+    }
+
+    #[test]
+    fn app_switch_keyboard_navigation_resets_pointer_baseline() {
+        let mut state = SwitchAppsInteractionState::new(1, (10, 20));
+        state.update_hover((11, 20), Some(4));
+
+        state.navigate(5, false, (30, 40));
+
+        assert_eq!(state.keyboard_index(), 2);
+        assert_eq!(state.hovered_index(), None);
+        assert!(!state.update_hover((30, 40), Some(4)));
+    }
+
+    #[test]
+    fn app_switch_reverse_navigation_wraps_from_keyboard_index() {
+        let mut state = SwitchAppsInteractionState::new(0, (10, 20));
+        state.update_hover((11, 20), Some(2));
+
+        state.navigate(4, true, (11, 20));
+
+        assert_eq!(state.keyboard_index(), 3);
+        assert_eq!(state.hovered_index(), None);
+        assert_eq!(state.displayed_index(), 3);
+    }
+
+    #[test]
+    fn app_switch_modifier_release_keeps_keyboard_target_while_hovered() {
+        let mut state = SwitchAppsInteractionState::new(1, (10, 20));
+        state.update_hover((11, 20), Some(3));
+
+        assert_eq!(state.keyboard_index(), 1);
+    }
+
+    #[test]
+    fn app_switch_mouse_leave_clears_hover_without_changing_keyboard_index() {
+        let mut state = SwitchAppsInteractionState::new(1, (10, 20));
+        state.update_hover((11, 20), Some(3));
+
+        assert!(state.clear_hover());
+        assert_eq!(state.keyboard_index(), 1);
+        assert_eq!(state.hovered_index(), None);
+        assert_eq!(state.displayed_index(), 1);
+        assert!(!state.clear_hover());
+    }
+
+    #[test]
+    fn mouse_message_position_preserves_signed_client_coordinates() {
+        let x = 7i16;
+        let y = -5i16;
+        let packed = u32::from(x as u16) | (u32::from(y as u16) << 16);
+
+        assert_eq!(client_pointer_position(LPARAM(packed as isize)), (7, -5));
+    }
+
+    #[test]
+    fn app_switch_display_resets_pointer_baseline_without_activating_hover() {
+        let mut state = SwitchAppsInteractionState::new(1, (10, 20));
+
+        state.reset_pointer_position((15, 25));
+
+        assert_eq!(state.hovered_index(), None);
+        assert!(!state.update_hover((15, 25), Some(3)));
+        assert!(state.update_hover((16, 25), Some(3)));
+    }
 
     #[test]
     fn merge_fixed_order_keeps_existing_positions_and_appends_new_windows() {

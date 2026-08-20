@@ -28,8 +28,8 @@ use windows::Win32::{
         HiDpi::GetDpiForWindow,
         Input::KeyboardAndMouse::SetFocus,
         WindowsAndMessaging::{
-            DrawIconEx, GetCursorPos, ShowWindow, UpdateLayeredWindow, DI_NORMAL, SW_HIDE, SW_SHOW,
-            ULW_ALPHA,
+            DrawIconEx, GetClientRect, ShowWindow, UpdateLayeredWindow, DI_NORMAL, SW_HIDE,
+            SW_SHOW, ULW_ALPHA,
         },
     },
 };
@@ -269,39 +269,56 @@ impl GdiAAPainter {
         self.show = false;
     }
 
-    pub fn find_clicked_app_index(&self, state: &SwitchAppsState) -> Option<usize> {
-        let cursor_pos = unsafe {
-            let mut pos = POINT::default();
-            let _ = GetCursorPos(&mut pos);
-            pos
-        };
-
+    pub fn find_app_index_at_client(
+        &self,
+        state: &SwitchAppsState,
+        pointer_position: (i32, i32),
+    ) -> Option<usize> {
         let dpi_scale = get_dpi_scale(self.hwnd);
-        let icon_size_max = (ICON_SIZE_BASE as f64 * dpi_scale) as i32;
         let border_size = (WINDOW_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
-        let icon_border = (ICON_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
-
-        let Coordinate {
-            x, y, item_size, ..
-        } = Coordinate::new(
-            state.apps.len() as i32,
-            icon_size_max,
-            border_size,
-            icon_border,
-        );
-
-        let xpos = cursor_pos.x - x;
-        let ypos = cursor_pos.y - y;
-
-        let cy = border_size;
-        for (i, _) in state.apps.iter().enumerate() {
-            let cx = border_size + item_size * (i as i32);
-            if xpos >= cx && xpos < cx + item_size && ypos >= cy && ypos < cy + item_size {
-                return Some(i);
-            }
+        let mut client_rect = RECT::default();
+        unsafe {
+            let _ = GetClientRect(self.hwnd, &mut client_rect);
         }
-        None
+        app_item_index_in_panel(
+            pointer_position,
+            client_rect.right - client_rect.left,
+            border_size,
+            state.apps.len(),
+        )
     }
+}
+
+fn app_item_index_in_panel(
+    pointer_position: (i32, i32),
+    panel_width: i32,
+    border_size: i32,
+    app_count: usize,
+) -> Option<usize> {
+    if app_count == 0 {
+        return None;
+    }
+    let item_size = (panel_width - border_size * 2) / app_count as i32;
+    app_item_index_at(pointer_position, (0, 0), border_size, item_size, app_count)
+}
+
+fn app_item_index_at(
+    pointer_position: (i32, i32),
+    panel_origin: (i32, i32),
+    border_size: i32,
+    item_size: i32,
+    app_count: usize,
+) -> Option<usize> {
+    if item_size <= 0 {
+        return None;
+    }
+    let x = pointer_position.0 - panel_origin.0 - border_size;
+    let y = pointer_position.1 - panel_origin.1 - border_size;
+    if x < 0 || y < 0 || y >= item_size {
+        return None;
+    }
+    let index = (x / item_size) as usize;
+    (index < app_count).then_some(index)
 }
 
 impl Drop for GdiAAPainter {
@@ -431,9 +448,10 @@ fn draw_icons(
 
         FillRect(hdc_scaled, &rect, bg_brush);
 
+        let displayed_index = state.displayed_index();
         for (i, (icon, _)) in state.apps.iter().enumerate() {
             // draw the box for selected icon
-            if i == state.index {
+            if i == displayed_index {
                 let left = scaled_icon_outer_size * (i as i32);
                 let top = 0;
                 let right = left + scaled_icon_outer_size;
@@ -570,6 +588,27 @@ impl Coordinate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_item_hit_test_uses_full_item_rectangles_and_excludes_panel_border() {
+        let origin = (100, 50);
+
+        assert_eq!(app_item_index_at((110, 60), origin, 10, 20, 3), Some(0));
+        assert_eq!(app_item_index_at((129, 79), origin, 10, 20, 3), Some(0));
+        assert_eq!(app_item_index_at((130, 60), origin, 10, 20, 3), Some(1));
+        assert_eq!(app_item_index_at((109, 60), origin, 10, 20, 3), None);
+        assert_eq!(app_item_index_at((110, 80), origin, 10, 20, 3), None);
+        assert_eq!(app_item_index_at((170, 60), origin, 10, 20, 3), None);
+    }
+
+    #[test]
+    fn app_item_hit_test_derives_item_size_from_rendered_panel_width() {
+        assert_eq!(app_item_index_in_panel((10, 10), 80, 10, 3), Some(0));
+        assert_eq!(app_item_index_in_panel((49, 29), 80, 10, 3), Some(1));
+        assert_eq!(app_item_index_in_panel((69, 29), 80, 10, 3), Some(2));
+        assert_eq!(app_item_index_in_panel((70, 10), 80, 10, 3), None);
+        assert_eq!(app_item_index_in_panel((10, 30), 80, 10, 3), None);
+    }
 
     #[test]
     fn gdiplus_hdc_surface_uses_premultiplied_alpha() {
