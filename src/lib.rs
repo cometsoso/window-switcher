@@ -5,10 +5,12 @@ pub mod macros;
 extern crate log;
 
 mod app;
+mod app_delay;
 mod config;
 mod foreground;
 mod keyboard;
 mod painter;
+mod session;
 mod startup;
 mod trayicon;
 
