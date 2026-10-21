@@ -1,11 +1,66 @@
 use crate::app::SwitchAppsState;
+use crate::session::InputSessionToken;
 use crate::utils::{
     check_error, draw_normalized_icon, get_moinitor_rect, is_light_theme, is_win11,
     normalized_hicon_rect,
 };
 
 use anyhow::{Context, Result};
+use std::cell::Cell;
 use std::ffi::c_void;
+
+fn reconcile_visibility(owner: &Cell<Option<u64>>, mut apply: impl FnMut(bool)) {
+    loop {
+        let show = owner.get().is_some();
+        apply(show);
+        // The outer ShowWindow can finish after a nested ShowWindow. Reconcile
+        // the actual API effect, not just our logical flag. A newer visible owner
+        // needs no hide, including when the old token has become stale.
+        if owner.get().is_some() == show {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    use super::*;
+
+    #[test]
+    fn review_show_completion_after_reentrant_cancel_restores_actual_hidden_state() {
+        let owner = Cell::new(Some(1));
+        let mut actual = false;
+        let mut calls = 0;
+        reconcile_visibility(&owner, |show| {
+            calls += 1;
+            if calls == 1 {
+                owner.set(None);
+            } // cancel/hide inside ShowWindow
+            actual = show; // the outer API finishes *after* the nested hide
+        });
+        assert!(!actual);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn review_stale_show_does_not_hide_a_new_round_and_stale_hide_repairs_new_show() {
+        for initially_showing in [false, true] {
+            let owner = Cell::new(initially_showing.then_some(1));
+            let mut actual = false;
+            let mut calls = 0;
+            reconcile_visibility(&owner, |show| {
+                calls += 1;
+                if calls == 1 {
+                    owner.set(Some(2));
+                } // nested cancellation + new round show
+                actual = show;
+            });
+            assert!(actual);
+            assert_eq!(owner.get(), Some(2));
+            assert_eq!(calls, if initially_showing { 1 } else { 2 });
+        }
+    }
+}
 use windows::Win32::{
     Foundation::{COLORREF, HWND, POINT, RECT, SIZE},
     Graphics::{
@@ -89,7 +144,7 @@ pub struct GdiAAPainter {
     hwnd: HWND,
     hdc_screen: HDC,
     rounded_corner: bool,
-    show: bool,
+    visible_owner: Cell<Option<u64>>,
 }
 
 impl GdiAAPainter {
@@ -110,11 +165,14 @@ impl GdiAAPainter {
             hwnd,
             hdc_screen,
             rounded_corner,
-            show: false,
+            visible_owner: Cell::new(None),
         })
     }
 
-    pub fn paint(&mut self, state: &SwitchAppsState) {
+    pub fn paint(&self, state: &SwitchAppsState, token: InputSessionToken<'_>) -> bool {
+        if !token.is_current() {
+            return false;
+        }
         let dpi_scale = get_dpi_scale(self.hwnd);
         let icon_size_max = (ICON_SIZE_BASE as f64 * dpi_scale) as i32;
         let border_size = (WINDOW_BORDER_SIZE_BASE as f64 * dpi_scale) as i32;
@@ -150,7 +208,7 @@ impl GdiAAPainter {
             let Some((bitmap_mem, _bits_mem)) = create_top_down_dib(hdc_screen, width, height)
             else {
                 let _ = DeleteDC(hdc_mem);
-                return;
+                return false;
             };
             SelectObject(hdc_mem, bitmap_mem.into());
 
@@ -208,7 +266,7 @@ impl GdiAAPainter {
             if bitmap_icons.is_invalid() {
                 let _ = DeleteDC(hdc_mem);
                 let _ = DeleteObject(bitmap_mem.into());
-                return;
+                return false;
             }
 
             let hdc_icons = CreateCompatibleDC(Some(hdc_screen));
@@ -232,41 +290,58 @@ impl GdiAAPainter {
                 AlphaFormat: AC_SRC_ALPHA as _,
                 ..Default::default()
             };
-            let _ = UpdateLayeredWindow(
-                hwnd,
-                Some(hdc_screen),
-                Some(&POINT { x, y }),
-                Some(&SIZE {
-                    cx: width,
-                    cy: height,
-                }),
-                Some(hdc_mem),
-                Some(&POINT::default()),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
+            if token.is_current() {
+                let _ = UpdateLayeredWindow(
+                    hwnd,
+                    Some(hdc_screen),
+                    Some(&POINT { x, y }),
+                    Some(&SIZE {
+                        cx: width,
+                        cy: height,
+                    }),
+                    Some(hdc_mem),
+                    Some(&POINT::default()),
+                    COLORREF(0),
+                    Some(&blend),
+                    ULW_ALPHA,
+                );
+            }
 
             let _ = DeleteDC(hdc_mem);
             let _ = DeleteObject(bitmap_icons.into());
             let _ = DeleteObject(bitmap_mem.into());
         }
 
-        if self.show {
-            return;
+        if !token.is_current() {
+            return false;
         }
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
-            let _ = SetFocus(Some(self.hwnd));
+        if self.visible_owner.get() != Some(token.generation()) {
+            self.visible_owner.set(Some(token.generation()));
+            self.reconcile_visibility();
+            if token.is_current() && self.visible_owner.get() == Some(token.generation()) {
+                unsafe {
+                    let _ = SetFocus(Some(self.hwnd));
+                }
+            }
         }
-        self.show = true;
+        token.is_current() && self.visible_owner.get() == Some(token.generation())
     }
 
-    pub fn unpaint(&mut self, _state: SwitchAppsState) {
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
+    pub fn is_visible(&self) -> bool {
+        self.visible_owner.get().is_some()
+    }
+
+    pub fn unpaint(&self) {
+        if self.visible_owner.replace(None).is_none() {
+            return;
         }
-        self.show = false;
+        self.reconcile_visibility();
+    }
+
+    fn reconcile_visibility(&self) {
+        reconcile_visibility(&self.visible_owner, |show| unsafe {
+            let _ = ShowWindow(self.hwnd, if show { SW_SHOW } else { SW_HIDE });
+        });
     }
 
     pub fn find_app_index_at_client(
@@ -468,7 +543,10 @@ fn draw_icons(
                 let _ = DeleteObject(rgn.into());
             }
 
-            let Some(candidate) = icon.selected(scaled_icon_inner_size) else {
+            let Some(candidate) = icon
+                .as_ref()
+                .and_then(|icon| icon.selected(scaled_icon_inner_size))
+            else {
                 continue;
             };
             let cx = scaled_border_size + scaled_icon_outer_size * i as i32;

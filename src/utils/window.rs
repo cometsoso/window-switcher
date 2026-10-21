@@ -393,10 +393,21 @@ pub fn get_window_exe(hwnd: HWND) -> Option<String> {
 }
 
 pub fn set_foreground_window(hwnd: HWND) {
+    set_foreground_window_while(hwnd, || true);
+}
+
+/// Recheck after APIs which can dispatch messages, not just before activation.
+pub fn set_foreground_window_while(hwnd: HWND, is_current: impl Fn() -> bool) {
     // ref https://github.com/microsoft/PowerToys/blob/4cb72ee126caf1f720c507f6a1dbe658cd515366/src/modules/fancyzones/FancyZonesLib/WindowUtils.cpp#L191
     unsafe {
+        if !is_current() {
+            return;
+        }
         if is_iconic_window(hwnd) {
             let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        if !is_current() {
+            return;
         }
 
         let input = INPUT {
@@ -406,7 +417,9 @@ pub fn set_foreground_window(hwnd: HWND) {
 
         SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
 
-        let _ = SetForegroundWindow(hwnd);
+        if is_current() {
+            let _ = SetForegroundWindow(hwnd);
+        }
     };
 }
 

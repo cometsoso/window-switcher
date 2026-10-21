@@ -1,20 +1,25 @@
+use crate::app_delay::AppDelay;
 use crate::config::{edit_config_file, Config};
 use crate::foreground::ForegroundWatcher;
 use crate::keyboard::KeyboardListener;
 use crate::painter::GdiAAPainter;
+use crate::session::{
+    Availability, InputSessionToken, SessionNotifications, INPUT_SESSION_EPOCH, REGISTRATION_TIMER,
+};
 use crate::startup::Startup;
 use crate::trayicon::TrayIcon;
 use crate::utils::{
     check_error, get_app_icon, get_foreground_window, get_process_start_time, get_window_user_data,
-    is_iconic_window, is_running_as_admin, list_windows, set_foreground_window,
+    is_iconic_window, is_running_as_admin, list_windows, set_foreground_window_while,
     set_window_user_data, AppIcon,
 };
 
 use anyhow::{anyhow, Result};
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 use std::{
     collections::{HashMap, HashSet},
     rc::Rc,
+    time::Instant,
 };
 use windows::core::{w, PCWSTR};
 use windows::Win32::{
@@ -25,11 +30,12 @@ use windows::Win32::{
         Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT},
         WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DispatchMessageW, GetCursorPos, GetMessageW,
-            GetWindowLongPtrW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
-            RegisterWindowMessageW, SetWindowLongPtrW, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-            CW_USEDEFAULT, GWL_STYLE, HTCLIENT, IDC_ARROW, MSG, WINDOW_STYLE, WM_COMMAND,
-            WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_RBUTTONUP, WNDCLASSW,
-            WS_CAPTION, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+            GetWindowLongPtrW, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage,
+            RegisterClassW, RegisterWindowMessageW, SetTimer, SetWindowLongPtrW, TranslateMessage,
+            CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_STYLE, HTCLIENT, IDC_ARROW, MSG,
+            WINDOW_STYLE, WM_COMMAND, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST,
+            WM_RBUTTONUP, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_CAPTION, WS_EX_LAYERED,
+            WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
         },
     },
 };
@@ -42,6 +48,7 @@ pub const WM_USER_SWITCH_APPS_DONE: u32 = 6011;
 pub const WM_USER_SWITCH_APPS_CANCEL: u32 = 6012;
 pub const WM_USER_SWITCH_WINDOWS: u32 = 6020;
 pub const WM_USER_SWITCH_WINDOWS_DONE: u32 = 6021;
+pub const WM_USER_RESET_INPUT_SESSION: u32 = 6030;
 pub const IDM_EXIT: u32 = 1;
 pub const IDM_STARTUP: u32 = 2;
 pub const IDM_CONFIGURE: u32 = 3;
@@ -63,14 +70,18 @@ pub struct App {
     switch_windows_state: SwitchWindowsState,
     fixed_order_windows: HashMap<String, Vec<isize>>,
     switch_apps_state: Option<SwitchAppsState>,
+    switch_apps_presentation: Option<SwitchAppsPresentation<'static>>,
+    next_presentation_id: usize,
     cached_icons: HashMap<String, CachedAppIcon>,
-    painter: GdiAAPainter,
+    painter: Rc<GdiAAPainter>,
+    session_notifications: Option<SessionNotifications>,
+    session_availability: Availability,
 }
 
 impl App {
     pub fn start(config: &Config) -> Result<()> {
         let hwnd = Self::create_window()?;
-        let painter = GdiAAPainter::new(hwnd)?;
+        let painter = Rc::new(GdiAAPainter::new(hwnd)?);
 
         let _foreground_watcher = ForegroundWatcher::init(&config.switch_windows_blacklist)?;
         let _keyboard_listener = KeyboardListener::init(hwnd, &config.to_hotkeys())?;
@@ -97,8 +108,12 @@ impl App {
             },
             fixed_order_windows: Default::default(),
             switch_apps_state: None,
+            switch_apps_presentation: None,
+            next_presentation_id: REGISTRATION_TIMER + 1,
             cached_icons: Default::default(),
             painter,
+            session_notifications: None,
+            session_availability: Availability::default(),
         };
 
         app.set_trayicon();
@@ -107,7 +122,20 @@ impl App {
         check_error(|| set_window_user_data(hwnd, app_ptr))
             .map_err(|err| anyhow!("Failed to set window ptr, {err}"))?;
 
-        Self::eventloop()
+        // Registration may call into Windows: publish App first, and don't hold an
+        // App reference across the call in case a notification is dispatched.
+        let result = (|| {
+            let notifications = SessionNotifications::new(hwnd)?;
+            get_app(hwnd)?.session_notifications = Some(notifications);
+            Self::eventloop()
+        })();
+        // Also release the registration on startup/message-loop errors or WM_QUIT
+        // not sent by our Exit command. Exit itself clears the pointer first.
+        if let Ok(app) = get_app(hwnd) {
+            set_window_user_data(hwnd, 0);
+            unsafe { drop(Box::from_raw(app)) }
+        }
+        result
     }
 
     fn eventloop() -> Result<()> {
@@ -228,6 +256,54 @@ impl App {
 
     fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Result<LRESULT> {
         match msg {
+            WM_WTSSESSION_CHANGE => {
+                let app = get_app(hwnd)?;
+                if let Some(blocked) = app.session_availability.change(wparam.0 as u32) {
+                    crate::keyboard::reset_session(blocked);
+                    app.reset_input_session();
+                }
+                return Ok(LRESULT(0));
+            }
+            WM_TIMER if wparam.0 == REGISTRATION_TIMER => {
+                if let Some(mut notifications) = get_app(hwnd)?.session_notifications.take() {
+                    let result = notifications.retry();
+                    get_app(hwnd)?.session_notifications = Some(notifications);
+                    result?;
+                }
+                return Ok(LRESULT(0));
+            }
+            WM_TIMER => {
+                let current = get_app(hwnd)?
+                    .switch_apps_presentation
+                    .as_mut()
+                    .is_some_and(|session| session.accept_timer(wparam.0));
+                if current {
+                    let _ = unsafe { KillTimer(Some(hwnd), wparam.0) };
+                    // A coarse Windows tick may arrive before our Instant deadline.
+                    // Re-arm even during construction, rather than losing the reveal.
+                    let remaining = get_app(hwnd)?
+                        .switch_apps_presentation
+                        .as_ref()
+                        .map_or(0, |session| session.delay.remaining_ms(Instant::now()));
+                    if remaining != 0
+                        && unsafe { SetTimer(Some(hwnd), wparam.0, remaining, None) } == 0
+                    {
+                        warn!(
+                            "Failed to re-arm application UI delay: {:?}; showing immediately",
+                            unsafe { GetLastError() }
+                        );
+                        if let Some(session) = get_app(hwnd)?.switch_apps_presentation.as_mut() {
+                            session.delay.timer_failed();
+                        }
+                    }
+                    Self::present_switch_apps(hwnd, false)?;
+                }
+                return Ok(LRESULT(0));
+            }
+            WM_USER_RESET_INPUT_SESSION => {
+                get_app(hwnd)?.reset_input_session();
+                return Ok(LRESULT(0));
+            }
             WM_USER_TRAYICON => {
                 let app = get_app(hwnd)?;
                 if let Some(trayicon) = app.trayicon.as_mut() {
@@ -240,15 +316,67 @@ impl App {
             }
             WM_USER_SWITCH_APPS => {
                 debug!("message WM_USER_SWITCH_APPS");
-                let app = get_app(hwnd)?;
+                let started = Instant::now();
                 let reverse = lparam.0 == 1;
-                let starting = app.switch_apps_state.is_none();
-                app.switch_apps(reverse)?;
-                if let Some(state) = &app.switch_apps_state {
-                    app.painter.paint(state);
+                if get_app(hwnd)?
+                    .switch_apps_presentation
+                    .as_ref()
+                    .is_some_and(|session| session.delay.released())
+                {
+                    get_app(hwnd)?.cancel_switch_app();
                 }
-                if starting {
-                    app.reset_pointer_position();
+                if let Some(session) = get_app(hwnd)?.switch_apps_presentation.as_mut() {
+                    session.delay.navigate(reverse);
+                    Self::present_switch_apps(hwnd, true)?;
+                } else {
+                    let (id, delay, token) = {
+                        let app = get_app(hwnd)?;
+                        let id = app.next_presentation_id;
+                        app.next_presentation_id = id
+                            .checked_add(1)
+                            .ok_or_else(|| anyhow!("Application UI timer IDs exhausted"))?;
+                        INPUT_SESSION_EPOCH.invalidate();
+                        let token = INPUT_SESSION_EPOCH.capture();
+                        // An arrow remains immediate even if the hook's active
+                        // cycle outlived an empty/canceled UI presentation.
+                        let delay = if wparam.0 != 0 {
+                            0
+                        } else {
+                            app.config.switch_apps_ui_delay_ms
+                        };
+                        app.switch_apps_presentation = Some(SwitchAppsPresentation {
+                            delay: AppDelay::new(id, started, delay),
+                            token,
+                            mouse_ready: false,
+                            icon_sources: None,
+                            loading_icons: false,
+                        });
+                        let remaining = app
+                            .switch_apps_presentation
+                            .as_ref()
+                            .unwrap()
+                            .delay
+                            .remaining_ms(Instant::now());
+                        (id, remaining, token)
+                    };
+                    if delay != 0 && unsafe { SetTimer(Some(hwnd), id, delay, None) } == 0 {
+                        warn!(
+                            "Failed to schedule application UI delay: {:?}; showing immediately",
+                            unsafe { GetLastError() }
+                        );
+                        if let Some(session) = get_app(hwnd)?.switch_apps_presentation.as_mut() {
+                            session.delay.timer_failed();
+                        }
+                    }
+                    let result = Self::switch_apps(hwnd, reverse, token);
+                    if token.is_current() {
+                        if result.is_err() || get_app(hwnd)?.switch_apps_state.is_none() {
+                            get_app(hwnd)?.cancel_switch_app();
+                        } else {
+                            Self::present_switch_apps(hwnd, false)?;
+                        }
+                    }
+                    result?;
                 }
             }
             WM_USER_SWITCH_APPS_DONE => {
@@ -263,15 +391,35 @@ impl App {
             }
             WM_USER_SWITCH_WINDOWS => {
                 debug!("message WM_USER_SWITCH_WINDOWS");
-                let app = get_app(hwnd)?;
+                let token = INPUT_SESSION_EPOCH.capture();
                 let reverse = lparam.0 == 1;
-                let hwnd = app
-                    .switch_apps_state
-                    .as_ref()
-                    .and_then(|state| state.apps.get(state.keyboard_index()).map(|(_, id)| *id))
-                    .unwrap_or_else(get_foreground_window);
-                app.switch_windows(hwnd, reverse)?;
-                app.cancel_switch_app();
+                let (target, config, is_admin) = {
+                    let app = get_app(hwnd)?;
+                    let target = app
+                        .switch_apps_state
+                        .as_ref()
+                        .and_then(|state| state.apps.get(state.keyboard_index()).map(|(_, id)| *id))
+                        .unwrap_or_else(get_foreground_window);
+                    (target, app.config.clone(), app.is_admin)
+                };
+                // Window enumeration can pump COM/Win32 messages. No App borrow
+                // or cache reference may span it, and its result is session-bound.
+                let windows = list_windows(
+                    config.switch_windows_ignore_minimal,
+                    config.switch_windows_only_current_desktop(),
+                    is_admin,
+                )?;
+                if !token.is_current() {
+                    return Ok(LRESULT(0));
+                }
+                let target =
+                    get_app(hwnd)?.select_switch_window(target, reverse, &windows, token)?;
+                if let Some(target) = target {
+                    set_foreground_window_while(target, || token.is_current());
+                }
+                token
+                    .run_if_current(|| get_app(hwnd).map(|app| app.cancel_switch_app()))
+                    .transpose()?;
             }
             WM_USER_SWITCH_WINDOWS_DONE => {
                 debug!("message WM_USER_SWITCH_WINDOWS_DONE");
@@ -301,6 +449,7 @@ impl App {
                     match id {
                         IDM_EXIT => {
                             if let Ok(app) = get_app(hwnd) {
+                                set_window_user_data(hwnd, 0);
                                 unsafe { drop(Box::from_raw(app)) }
                             }
                             unsafe { PostQuitMessage(0) }
@@ -334,12 +483,16 @@ impl App {
         Ok(unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) })
     }
 
-    fn switch_windows(&mut self, hwnd: HWND, reverse: bool) -> Result<bool> {
-        let windows = list_windows(
-            self.config.switch_windows_ignore_minimal,
-            self.config.switch_windows_only_current_desktop(),
-            self.is_admin,
-        )?;
+    fn select_switch_window(
+        &mut self,
+        hwnd: HWND,
+        reverse: bool,
+        windows: &IndexMap<String, Vec<(HWND, String)>>,
+        token: InputSessionToken<'_>,
+    ) -> Result<Option<HWND>> {
+        if !token.is_current() {
+            return Ok(None);
+        }
         debug!(
             "switch windows: hwnd:{hwnd:?} reverse:{reverse} state:{:?}",
             self.switch_windows_state
@@ -350,10 +503,10 @@ impl App {
             .map(|(k, _)| k.clone())
         {
             Some(v) => v,
-            None => return Ok(false),
+            None => return Ok(None),
         };
         match windows.get(&module_path) {
-            None => Ok(false),
+            None => Ok(None),
             Some(windows) => {
                 let fixed_order = self.uses_fixed_window_order(&module_path);
                 let mut window_ids: Vec<isize> =
@@ -372,7 +525,7 @@ impl App {
 
                 let windows_len = window_ids.len();
                 if windows_len <= 1 {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 let current_id = if fixed_order {
                     HWND(window_ids[0] as _)
@@ -404,7 +557,7 @@ impl App {
                                 reverse,
                             ) {
                                 Some(index) => index,
-                                None => return Ok(false),
+                                None => return Ok(None),
                             };
                         }
                     }
@@ -451,106 +604,238 @@ impl App {
                     state_windows = window_ids.clone();
                 }
                 let hwnd = HWND(state_windows[index] as _);
-                self.switch_windows_state = SwitchWindowsState {
-                    cache: Some((module_path.clone(), state_id, index, state_windows)),
-                    modifier_released: false,
-                };
-                set_foreground_window(hwnd);
-
-                Ok(true)
+                Ok(token.run_if_current(|| {
+                    self.switch_windows_state = SwitchWindowsState {
+                        cache: Some((module_path.clone(), state_id, index, state_windows)),
+                        modifier_released: false,
+                    };
+                    hwnd
+                }))
             }
         }
     }
 
-    fn switch_apps(&mut self, reverse: bool) -> Result<()> {
-        debug!(
-            "switch apps: reverse:{reverse}, state:{:?}",
-            self.switch_apps_state
-        );
-        if let Some(state) = self.switch_apps_state.as_mut() {
-            let mut pointer_position = POINT::default();
-            unsafe {
-                let _ = GetCursorPos(&mut pointer_position);
-            }
-            state.navigate(reverse, (pointer_position.x, pointer_position.y));
-            debug!("switch apps: new index:{}", state.keyboard_index());
+    fn switch_apps(hwnd: HWND, reverse: bool, token: InputSessionToken<'_>) -> Result<()> {
+        if !token.is_current() {
             return Ok(());
         }
+        let (config, is_admin) = {
+            let app = get_app(hwnd)?;
+            debug!(
+                "switch apps: reverse:{reverse}, state:{:?}",
+                app.switch_apps_state
+            );
+            (app.config.clone(), app.is_admin)
+        };
         let windows = list_windows(
-            self.config.switch_apps_ignore_minimal,
-            self.config.switch_apps_only_current_desktop(),
-            self.is_admin,
+            config.switch_apps_ignore_minimal,
+            config.switch_apps_only_current_desktop(),
+            is_admin,
         )?;
-        let mut apps = vec![];
-        for (module_path, hwnds) in windows.iter() {
-            let module_hwnd = if is_iconic_window(hwnds[0].0) {
-                hwnds[hwnds.len() - 1].0
-            } else {
-                hwnds[0].0
-            };
-            let identities = hwnds
-                .iter()
-                .map(|(hwnd, _)| get_process_start_time(*hwnd))
-                .collect::<Option<Vec<_>>>()
-                .map(|mut identities| {
-                    identities.sort_unstable();
-                    identities.dedup();
-                    identities
-                });
-            let icon = self
-                .cached_icons
-                .get(module_path)
-                .filter(|cached| {
-                    identities.is_some() && cached.identities.as_ref() == identities.as_ref()
-                })
-                .map(|cached| Rc::clone(&cached.icon));
-            let icon = icon.unwrap_or_else(|| {
-                let icon = Rc::new(get_app_icon(
-                    &self.config.switch_apps_override_icons,
-                    module_path,
-                    module_hwnd,
-                ));
-                self.cached_icons.insert(
-                    module_path.clone(),
-                    CachedAppIcon {
-                        icon: Rc::clone(&icon),
-                        identities,
-                    },
-                );
-                icon
-            });
-            apps.push((icon, module_hwnd));
-        }
-        let num_apps = apps.len() as i32;
-        if num_apps == 0 {
+        if !token.is_current() {
             return Ok(());
         }
-
-        let index = if apps.len() == 1 {
-            0
-        } else if reverse {
-            apps.len() - 1
-        } else {
-            1
+        let targets: Vec<_> = windows
+            .values()
+            .map(|hwnds| {
+                if is_iconic_window(hwnds[0].0) {
+                    hwnds[hwnds.len() - 1].0
+                } else {
+                    hwnds[0].0
+                }
+            })
+            .collect();
+        let Some(mut state) = SwitchAppsState::from_targets(targets.clone(), reverse) else {
+            return Ok(());
         };
-
-        let mut pointer_position = POINT::default();
-        unsafe {
-            let _ = GetCursorPos(&mut pointer_position);
+        if !token.is_current() {
+            return Ok(());
         }
-        let state = SwitchAppsState {
-            apps,
-            interaction: SwitchAppsInteractionState::new(
-                index,
-                (pointer_position.x, pointer_position.y),
-            ),
-        };
-        self.switch_apps_state = Some(state);
-        debug!("switch apps, new state:{:?}", self.switch_apps_state);
+        {
+            let app = get_app(hwnd)?;
+            if let Some(session) = app.switch_apps_presentation.as_mut() {
+                state.apply_navigation(&mut session.delay, (0, 0));
+                session.icon_sources = Some(
+                    windows
+                        .into_iter()
+                        .zip(targets)
+                        .map(|((module_path, hwnds), target)| AppIconSource {
+                            module_path,
+                            hwnds: hwnds.into_iter().map(|(hwnd, _)| hwnd).collect(),
+                            target,
+                        })
+                        .collect(),
+                );
+            }
+            app.switch_apps_state = Some(state);
+        }
         Ok(())
     }
 
+    fn present_switch_apps(hwnd: HWND, repaint: bool) -> Result<()> {
+        let (token, work) = {
+            let app = get_app(hwnd)?;
+            let Some(session) = app.switch_apps_presentation.as_mut() else {
+                return Ok(());
+            };
+            if !session.token.is_current() {
+                return Ok(());
+            }
+            let Some(state) = app.switch_apps_state.as_mut() else {
+                return Ok(());
+            };
+            // Nested navigation must update the live lightweight selection even
+            // while WM_GETICON is pumping messages, but never start another load.
+            state.apply_navigation(&mut session.delay, (0, 0));
+            if session.delay.released() {
+                app.do_switch_app();
+                return Ok(());
+            }
+            if session.loading_icons {
+                return Ok(());
+            }
+            if session.icon_sources.is_some() {
+                let Some(sources) = session.begin_icon_load(Instant::now()) else {
+                    return Ok(());
+                };
+                (session.token, Some((session.delay.id, sources)))
+            } else if repaint && session.delay.accepts_mouse() {
+                (session.token, None)
+            } else {
+                return Ok(());
+            }
+        };
+        if let Some((id, sources)) = work {
+            let _ = unsafe { KillTimer(Some(hwnd), id) };
+            // Only the display path snapshots the cache or queries identities.
+            // All Win32 icon work uses owned data, without an App borrow.
+            Self::load_switch_app_icons(hwnd, sources, token)?;
+            if !token.is_current() {
+                return Ok(());
+            }
+            if let Some(session) = get_app(hwnd)?.switch_apps_presentation.as_mut() {
+                session.loading_icons = false;
+            }
+        }
+        let mut pointer = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut pointer);
+        }
+        if !token.is_current() {
+            return Ok(());
+        }
+        let (state, initialize_mouse) = {
+            let app = get_app(hwnd)?;
+            let Some(session) = app.switch_apps_presentation.as_mut() else {
+                return Ok(());
+            };
+            if !session.token.is_current() || session.loading_icons {
+                return Ok(());
+            }
+            let Some(state) = app.switch_apps_state.as_mut() else {
+                return Ok(());
+            };
+            // Never restore a pre-load snapshot: nested input may have navigated.
+            state.apply_navigation(&mut session.delay, (pointer.x, pointer.y));
+            state.reset_pointer_position((pointer.x, pointer.y));
+            (state.clone(), !session.mouse_ready)
+        };
+        // The owned Rc keeps painter storage independent of a reentrant App borrow.
+        let painter = Rc::clone(&get_app(hwnd)?.painter);
+        let shown = token.is_current() && painter.paint(&state, token);
+        if initialize_mouse && shown && token.is_current() {
+            let mut pointer = POINT::default();
+            unsafe {
+                let _ = GetCursorPos(&mut pointer);
+            }
+            if token.is_current() {
+                let app = get_app(hwnd)?;
+                if let Some(state) = app.switch_apps_state.as_mut() {
+                    state.reset_pointer_position((pointer.x, pointer.y));
+                }
+                if let Some(session) = app.switch_apps_presentation.as_mut() {
+                    session.mouse_ready = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn load_switch_app_icons(
+        hwnd: HWND,
+        sources: Vec<AppIconSource>,
+        token: InputSessionToken<'_>,
+    ) -> Result<()> {
+        if !token.is_current() {
+            return Ok(());
+        }
+        let (config, mut cached_icons) = {
+            let app = get_app(hwnd)?;
+            (app.config.clone(), app.cached_icons.clone())
+        };
+        build_icons_while_current(
+            sources.into_iter().enumerate(),
+            token,
+            |(index, source)| {
+                let module_path = &source.module_path;
+                let identities =
+                    icon_identities_while_current(&source.hwnds, token, get_process_start_time);
+                if !token.is_current() {
+                    return Ok(None);
+                }
+                let icon = cached_icons
+                    .get(module_path)
+                    .and_then(|cached| cached.reuse(&identities));
+                let icon = icon.unwrap_or_else(|| {
+                    let icon = Rc::new(get_app_icon(
+                        &config.switch_apps_override_icons,
+                        module_path,
+                        source.target,
+                    ));
+                    cached_icons.insert(
+                        module_path.clone(),
+                        CachedAppIcon {
+                            icon: Rc::clone(&icon),
+                            identities,
+                        },
+                    );
+                    icon
+                });
+                Ok(Some((index, icon)))
+            },
+            |result| {
+                let Some((index, icon)) = result else {
+                    return Ok(());
+                };
+                if let Some(state) = get_app(hwnd)?.switch_apps_state.as_mut() {
+                    state.apps[index].0 = Some(icon);
+                }
+                Ok(())
+            },
+        )?;
+        token
+            .run_if_current(|| -> Result<()> {
+                let app = get_app(hwnd)?;
+                app.cached_icons = cached_icons;
+                debug!("switch apps, new state:{:?}", app.switch_apps_state);
+                Ok(())
+            })
+            .transpose()?;
+        Ok(())
+    }
+
+    fn accepts_mouse(&self) -> bool {
+        self.painter.is_visible()
+            && self
+                .switch_apps_presentation
+                .as_ref()
+                .is_some_and(|session| session.accepts_mouse())
+    }
+
     fn click(&mut self, lparam: LPARAM) {
+        if !self.accepts_mouse() {
+            return;
+        }
         let pointer_position = client_pointer_position(lparam);
         let clicked_index = self.switch_apps_state.as_ref().and_then(|state| {
             self.painter
@@ -562,6 +847,9 @@ impl App {
     }
 
     fn hover(&mut self, lparam: LPARAM) {
+        if !self.accepts_mouse() {
+            return;
+        }
         let Some(state) = self.switch_apps_state.as_mut() else {
             return;
         };
@@ -581,30 +869,33 @@ impl App {
             .painter
             .find_app_index_at_client(state, client_position);
         if state.update_hover((pointer_position.x, pointer_position.y), hovered_index) {
-            self.painter.paint(state);
+            let state = state.clone();
+            let painter = Rc::clone(&self.painter);
+            painter.paint(&state, INPUT_SESSION_EPOCH.capture());
         }
     }
 
     fn clear_hover(&mut self) {
+        if !self.accepts_mouse() {
+            return;
+        }
         if let Some(state) = self.switch_apps_state.as_mut() {
             if state.clear_hover() {
-                self.painter.paint(state);
+                let state = state.clone();
+                let painter = Rc::clone(&self.painter);
+                painter.paint(&state, INPUT_SESSION_EPOCH.capture());
             }
         }
     }
 
-    fn reset_pointer_position(&mut self) {
-        let Some(state) = self.switch_apps_state.as_mut() else {
-            return;
-        };
-        let mut pointer_position = POINT::default();
-        unsafe {
-            let _ = GetCursorPos(&mut pointer_position);
-        }
-        state.reset_pointer_position((pointer_position.x, pointer_position.y));
-    }
-
     fn do_switch_app(&mut self) {
+        if let Some(session) = self.switch_apps_presentation.as_mut() {
+            if let Some(state) = self.switch_apps_state.as_mut() {
+                state.apply_navigation(&mut session.delay, (0, 0));
+            }
+            session.delay.release();
+            let _ = unsafe { KillTimer(Some(self.hwnd), session.delay.id) };
+        }
         let index = self
             .switch_apps_state
             .as_ref()
@@ -615,23 +906,38 @@ impl App {
     }
 
     fn do_switch_app_at(&mut self, index: usize) {
-        if let Some(state) = self.switch_apps_state.take() {
-            if let Some((_, id)) = state.apps.get(index) {
-                set_foreground_window(*id);
-            }
-            self.painter.unpaint(state);
+        let target = self
+            .switch_apps_state
+            .as_ref()
+            .and_then(|state| state.apps.get(index).map(|(_, id)| *id));
+        let token = self.cancel_switch_app();
+        if let Some(id) = target {
+            set_foreground_window_while(id, || token.is_current());
         }
     }
 
-    fn cancel_switch_app(&mut self) {
-        if let Some(state) = self.switch_apps_state.take() {
-            self.painter.unpaint(state);
+    fn cancel_switch_app(&mut self) -> InputSessionToken<'static> {
+        INPUT_SESSION_EPOCH.invalidate();
+        let token = INPUT_SESSION_EPOCH.capture();
+        if let Some(session) = self.switch_apps_presentation.take() {
+            let _ = unsafe { KillTimer(Some(self.hwnd), session.delay.id) };
         }
+        self.switch_apps_state = None;
+        let painter = Rc::clone(&self.painter);
+        painter.unpaint();
+        token
+    }
+
+    fn reset_input_session(&mut self) {
+        INPUT_SESSION_EPOCH.invalidate();
+        self.switch_windows_state.reset();
+        self.cancel_switch_app();
     }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.cancel_switch_app();
         self.cached_icons.clear();
     }
 }
@@ -640,6 +946,9 @@ fn get_app(hwnd: HWND) -> Result<&'static mut App> {
     unsafe {
         let ptr = check_error(|| get_window_user_data(hwnd))
             .map_err(|err| anyhow!("Failed to get window ptr, {err}"))?;
+        if ptr == 0 {
+            return Err(anyhow!("Application state is not available"));
+        }
         let tx: &mut App = &mut *(ptr as *mut App);
         Ok(tx)
     }
@@ -653,19 +962,124 @@ fn client_pointer_position(lparam: LPARAM) -> (i32, i32) {
     )
 }
 
+fn build_icons_while_current<T, U>(
+    sources: impl IntoIterator<Item = T>,
+    token: InputSessionToken<'_>,
+    mut load: impl FnMut(T) -> Result<U>,
+    mut publish: impl FnMut(U) -> Result<()>,
+) -> Result<()> {
+    for source in sources {
+        if !token.is_current() {
+            break;
+        }
+        let icon = load(source)?;
+        if !token.is_current() {
+            break;
+        }
+        publish(icon)?;
+    }
+    Ok(())
+}
+
+fn icon_identities_while_current(
+    hwnds: &[HWND],
+    token: InputSessionToken<'_>,
+    mut query: impl FnMut(HWND) -> Option<u64>,
+) -> Option<Vec<u64>> {
+    let mut identities = Vec::with_capacity(hwnds.len());
+    for hwnd in hwnds {
+        if !token.is_current() {
+            return None;
+        }
+        identities.push(query(*hwnd)?);
+    }
+    identities.sort_unstable();
+    identities.dedup();
+    token.is_current().then_some(identities)
+}
+
 #[derive(Debug)]
 struct SwitchWindowsState {
     cache: Option<(String, HWND, usize, Vec<isize>)>,
     modifier_released: bool,
 }
 
-#[derive(Debug)]
+impl SwitchWindowsState {
+    fn reset(&mut self) {
+        self.cache = None;
+        self.modifier_released = true;
+    }
+}
+
+struct SwitchAppsPresentation<'a> {
+    delay: AppDelay,
+    token: InputSessionToken<'a>,
+    mouse_ready: bool,
+    icon_sources: Option<Vec<AppIconSource>>,
+    loading_icons: bool,
+}
+
+impl SwitchAppsPresentation<'_> {
+    fn begin_icon_load(&mut self, now: Instant) -> Option<Vec<AppIconSource>> {
+        if !self.token.is_current()
+            || self.loading_icons
+            || self.icon_sources.is_none()
+            || !self.delay.show(now, true)
+        {
+            return None;
+        }
+        self.loading_icons = true;
+        self.icon_sources.take()
+    }
+
+    fn accept_timer(&mut self, id: usize) -> bool {
+        self.token.is_current() && self.delay.timer(id)
+    }
+
+    fn accepts_mouse(&self) -> bool {
+        self.token.is_current()
+            && !self.loading_icons
+            && self.mouse_ready
+            && self.delay.accepts_mouse()
+    }
+}
+
+#[derive(Clone)]
+struct AppIconSource {
+    module_path: String,
+    hwnds: Vec<HWND>,
+    target: HWND,
+}
+
+#[derive(Debug, Clone)]
 pub struct SwitchAppsState {
-    pub apps: Vec<(Rc<AppIcon>, HWND)>,
+    pub apps: Vec<(Option<Rc<AppIcon>>, HWND)>,
     interaction: SwitchAppsInteractionState,
 }
 
 impl SwitchAppsState {
+    fn from_targets(targets: Vec<HWND>, reverse: bool) -> Option<Self> {
+        if targets.is_empty() {
+            return None;
+        }
+        let index = if targets.len() == 1 {
+            0
+        } else if reverse {
+            targets.len() - 1
+        } else {
+            1
+        };
+        Some(Self {
+            apps: targets.into_iter().map(|target| (None, target)).collect(),
+            interaction: SwitchAppsInteractionState::new(index, (0, 0)),
+        })
+    }
+
+    fn apply_navigation(&mut self, delay: &mut AppDelay, pointer: (i32, i32)) {
+        for reverse in delay.take_navigation() {
+            self.navigate(reverse, pointer);
+        }
+    }
     pub fn displayed_index(&self) -> usize {
         self.interaction.displayed_index()
     }
@@ -693,7 +1107,7 @@ impl SwitchAppsState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SwitchAppsInteractionState {
     keyboard_index: usize,
     hovered_index: Option<usize>,
@@ -728,6 +1142,9 @@ impl SwitchAppsInteractionState {
         self.pointer_position = pointer_position;
         if self.hovered_index == hovered_index {
             return false;
+        }
+        if let Some(index) = hovered_index {
+            self.keyboard_index = index;
         }
         self.hovered_index = hovered_index;
         true
@@ -767,9 +1184,17 @@ impl SwitchAppsInteractionState {
     }
 }
 
+#[derive(Clone)]
 struct CachedAppIcon {
     icon: Rc<AppIcon>,
     identities: Option<Vec<u64>>,
+}
+
+impl CachedAppIcon {
+    fn reuse(&self, identities: &Option<Vec<u64>>) -> Option<Rc<AppIcon>> {
+        (identities.is_some() && self.identities.as_ref() == identities.as_ref())
+            .then(|| Rc::clone(&self.icon))
+    }
 }
 
 fn merge_fixed_order(order: &mut Vec<isize>, visible: &[isize]) {
@@ -850,6 +1275,421 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lightweight_round_does_not_prepare_icons_before_the_presentation_gate() {
+        // Guard the Win32 wiring as well as the model tests below: enumeration
+        // must not start display-only work during a hidden quick-switch round.
+        let source = include_str!("app.rs");
+        let switch = source
+            .split("    fn switch_apps(hwnd:")
+            .nth(1)
+            .unwrap()
+            .split("    fn present_switch_apps(")
+            .next()
+            .unwrap();
+        for eager_work in [
+            "build_icons_while_current(",
+            "get_process_start_time(",
+            "get_app_icon(",
+            "cached_icons.clone()",
+        ] {
+            assert!(
+                !switch.contains(eager_work),
+                "hidden round eagerly calls {eager_work}"
+            );
+        }
+    }
+
+    fn icon_session<'a>(
+        epoch: &'a crate::session::InputSessionEpoch,
+        now: Instant,
+        delay: u32,
+    ) -> SwitchAppsPresentation<'a> {
+        SwitchAppsPresentation {
+            delay: AppDelay::new(10, now, delay),
+            token: epoch.capture(),
+            mouse_ready: false,
+            icon_sources: Some(vec![AppIconSource {
+                module_path: "test.exe".into(),
+                hwnds: vec![HWND(1 as _)],
+                target: HWND(1 as _),
+            }]),
+            loading_icons: false,
+        }
+    }
+
+    #[test]
+    fn hidden_and_quick_release_do_not_start_any_icon_work() {
+        let epoch = crate::session::InputSessionEpoch::new();
+        let now = Instant::now();
+        let mut session = icon_session(&epoch, now, 150);
+        let mut loads = 0;
+        for elapsed in [0, 50, 149] {
+            if session
+                .begin_icon_load(now + std::time::Duration::from_millis(elapsed))
+                .is_some()
+            {
+                loads += 1;
+            }
+        }
+        session.delay.release();
+        if session
+            .begin_icon_load(now + std::time::Duration::from_millis(200))
+            .is_some()
+        {
+            loads += 1;
+        }
+        assert_eq!(loads, 0);
+        assert!(session.icon_sources.is_some());
+        assert!(!session.accepts_mouse());
+    }
+
+    #[test]
+    fn deadline_second_operation_zero_and_timer_failure_start_icons_exactly_once() {
+        let epoch = crate::session::InputSessionEpoch::new();
+        let now = Instant::now();
+        for trigger in 0..5 {
+            let mut session = icon_session(&epoch, now, if trigger == 3 { 0 } else { 150 });
+            let at = if trigger == 0 {
+                now + std::time::Duration::from_millis(150)
+            } else {
+                now
+            };
+            if trigger == 1 {
+                session.delay.navigate(false);
+            }
+            if trigger == 2 {
+                session.delay.navigate(true);
+            }
+            if trigger == 4 {
+                session.delay.timer_failed();
+            }
+            assert_eq!(session.begin_icon_load(at).unwrap().len(), 1);
+            assert!(session.loading_icons);
+            assert!(!session.accepts_mouse());
+            assert!(session.begin_icon_load(at).is_none());
+            session.loading_icons = false;
+            assert!(session.begin_icon_load(at).is_none());
+        }
+    }
+
+    #[test]
+    fn navigation_during_loading_is_applied_once_without_restarting_or_replacing_selection() {
+        let epoch = crate::session::InputSessionEpoch::new();
+        let now = Instant::now();
+        let session = std::cell::RefCell::new(icon_session(&epoch, now, 0));
+        let state = std::cell::RefCell::new(
+            SwitchAppsState::from_targets(vec![HWND(1 as _), HWND(2 as _), HWND(3 as _)], false)
+                .unwrap(),
+        );
+        assert!(session.borrow_mut().begin_icon_load(now).is_some());
+        let mut loads = 0;
+        build_icons_while_current(
+            0..2,
+            epoch.capture(),
+            |_| {
+                loads += 1;
+                let mut session = session.borrow_mut();
+                session.delay.navigate(false);
+                state
+                    .borrow_mut()
+                    .apply_navigation(&mut session.delay, (0, 0));
+                assert!(session.begin_icon_load(now).is_none());
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(loads, 2);
+        assert_eq!(state.borrow().keyboard_index(), 0); // not the initial selection (1)
+        state
+            .borrow_mut()
+            .apply_navigation(&mut session.borrow_mut().delay, (0, 0));
+        assert_eq!(state.borrow().keyboard_index(), 0);
+    }
+
+    #[test]
+    fn invalidated_load_cannot_publish_to_a_new_round_or_load_remaining_sources() {
+        let epoch = crate::session::InputSessionEpoch::new();
+        let now = Instant::now();
+        for reason in ["release", "escape", "lock", "new round"] {
+            let mut old = icon_session(&epoch, now, 0);
+            let mut not_started = icon_session(&epoch, now, 0);
+            let sources = old.begin_icon_load(now).unwrap();
+            let mut loads = 0;
+            let mut published = 0;
+            build_icons_while_current(
+                sources.into_iter().cycle().take(3),
+                old.token,
+                |_| {
+                    loads += 1;
+                    epoch.invalidate();
+                    Ok(())
+                },
+                |_| {
+                    published += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!((loads, published), (1, 0), "{reason}");
+            assert!(old.begin_icon_load(now).is_none());
+            assert!(not_started.begin_icon_load(now).is_none());
+            assert!(icon_session(&epoch, now, 0).begin_icon_load(now).is_some());
+        }
+    }
+
+    #[test]
+    fn identity_queries_stop_immediately_if_release_or_reset_reenters() {
+        let epoch = crate::session::InputSessionEpoch::new();
+        for hwnds in [vec![HWND(1 as _)], vec![HWND(1 as _), HWND(2 as _)]] {
+            let mut queries = 0;
+            let identities = icon_identities_while_current(&hwnds, epoch.capture(), |_| {
+                queries += 1;
+                epoch.invalidate();
+                Some(42)
+            });
+            assert_eq!(queries, 1);
+            assert!(identities.is_none());
+        }
+    }
+
+    #[test]
+    fn empty_enumeration_and_release_before_targets_cannot_start_display_preparation() {
+        let epoch = crate::session::InputSessionEpoch::new();
+        let now = Instant::now();
+        let mut session = icon_session(&epoch, now, 0);
+        let sources = session.icon_sources.take();
+        assert!(session.begin_icon_load(now).is_none());
+        assert!(!session.delay.accepts_mouse());
+        assert!(SwitchAppsState::from_targets(vec![], false).is_none());
+        // A timer/navigation can reenter enumeration, but must not consume the
+        // display gate until lightweight targets have actually been published.
+        session.delay.navigate(false);
+        session.icon_sources = sources;
+        assert!(session.begin_icon_load(now).is_some());
+        let mut released = icon_session(&epoch, now, 0);
+        let sources = released.icon_sources.take();
+        released.delay.release();
+        released.icon_sources = sources;
+        assert!(released.begin_icon_load(now).is_none());
+    }
+
+    #[test]
+    fn process_identities_remain_sorted_unique_and_unknown_identities_are_not_reused() {
+        let epoch = crate::session::InputSessionEpoch::new();
+        let hwnds = [HWND(3 as _), HWND(1 as _), HWND(3 as _)];
+        assert_eq!(
+            icon_identities_while_current(&hwnds, epoch.capture(), |hwnd| Some(hwnd.0 as u64)),
+            Some(vec![1, 3])
+        );
+        assert_eq!(
+            icon_identities_while_current(&hwnds, epoch.capture(), |_| None),
+            None
+        );
+    }
+
+    #[test]
+    fn eligible_round_reuses_cached_icon_only_for_verified_same_processes() {
+        // Empty/nonexistent source produces a harmless AppIcon fallback; these
+        // tests compare Rc ownership, not platform-specific icon pixels.
+        let icon = Rc::new(get_app_icon(&IndexMap::new(), "", HWND::default()));
+        let cached = CachedAppIcon {
+            icon: Rc::clone(&icon),
+            identities: Some(vec![1, 3]),
+        };
+        assert!(Rc::ptr_eq(&cached.reuse(&Some(vec![1, 3])).unwrap(), &icon));
+        assert!(cached.reuse(&Some(vec![1, 4])).is_none());
+        assert!(cached.reuse(&None).is_none());
+        let unknown = CachedAppIcon {
+            icon,
+            identities: None,
+        };
+        assert!(unknown.reuse(&None).is_none());
+        assert!(unknown.reuse(&Some(vec![1, 3])).is_none());
+    }
+
+    #[test]
+    fn review_release_during_first_icon_commits_lightweight_selection_and_stops_remaining_icons() {
+        use std::cell::RefCell;
+        let epoch = crate::session::InputSessionEpoch::new();
+        let token = epoch.capture();
+        for reverse in [false, true] {
+            let state = RefCell::new(
+                SwitchAppsState::from_targets(
+                    vec![HWND(1 as _), HWND(2 as _), HWND(3 as _)],
+                    reverse,
+                )
+                .unwrap(),
+            );
+            let mut loaded = 0;
+            let mut published = 0;
+            let mut committed = None;
+            let token = if reverse { epoch.capture() } else { token };
+            build_icons_while_current(
+                0..3,
+                token,
+                |_| {
+                    loaded += 1;
+                    let mut state = state.borrow_mut();
+                    let mut delay = AppDelay::new(10, Instant::now(), 150);
+                    delay.navigate(false);
+                    delay.navigate(false);
+                    delay.navigate(true);
+                    state.apply_navigation(&mut delay, (0, 0));
+                    state.apply_navigation(&mut delay, (0, 0)); // never double-apply
+                    committed = Some(state.apps[state.keyboard_index()].1);
+                    epoch.invalidate(); // release commits and cancels the builder immediately
+                    Ok(())
+                },
+                |_| {
+                    published += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(loaded, 1);
+            assert_eq!(published, 0);
+            assert_eq!(committed, Some(HWND(if reverse { 1 } else { 3 } as _)));
+        }
+        assert!(SwitchAppsState::from_targets(vec![], false).is_none());
+        let mut single = SwitchAppsState::from_targets(vec![HWND(1 as _)], true).unwrap();
+        single.navigate(true, (0, 0));
+        assert_eq!(single.keyboard_index(), 0);
+    }
+
+    #[test]
+    fn session_reset_and_queued_old_timers_cannot_reveal_a_new_round() {
+        let epoch = crate::session::InputSessionEpoch::new();
+        let now = Instant::now();
+        let mut old = SwitchAppsPresentation {
+            delay: AppDelay::new(10, now, 150),
+            token: epoch.capture(),
+            mouse_ready: false,
+            icon_sources: None,
+            loading_icons: false,
+        };
+        epoch.invalidate(); // lock, unlock, disconnect, or stale-modifier reset
+        assert!(!old.accept_timer(10));
+        assert!(!old.accepts_mouse());
+        let mut new = SwitchAppsPresentation {
+            delay: AppDelay::new(11, now, 150),
+            token: epoch.capture(),
+            mouse_ready: false,
+            icon_sources: None,
+            loading_icons: false,
+        };
+        assert!(!new.accept_timer(10)); // KillTimer does not purge a queued message
+        assert!(new.accept_timer(11));
+        assert!(new
+            .delay
+            .show(now + std::time::Duration::from_millis(150), true));
+        new.mouse_ready = true;
+        assert!(new.accepts_mouse());
+        epoch.invalidate();
+        assert!(!new.accepts_mouse());
+    }
+
+    #[test]
+    fn hidden_and_showing_before_pointer_baseline_ignore_all_mouse_actions() {
+        let epoch = crate::session::InputSessionEpoch::new();
+        let now = Instant::now();
+        let mut session = SwitchAppsPresentation {
+            delay: AppDelay::new(10, now, 150),
+            token: epoch.capture(),
+            mouse_ready: false,
+            icon_sources: None,
+            loading_icons: false,
+        };
+        let mut interaction = SwitchAppsInteractionState::new(1, (0, 0));
+        let mut clicks = 0;
+        for showing in [false, true] {
+            if showing {
+                assert!(session
+                    .delay
+                    .show(now + std::time::Duration::from_millis(150), true));
+            }
+            if session.accepts_mouse() {
+                interaction.update_hover((50, 60), Some(3));
+                interaction.clear_hover();
+                clicks += 1;
+            }
+            assert_eq!(interaction.keyboard_index(), 1);
+            assert_eq!(clicks, 0);
+        }
+        interaction.reset_pointer_position((50, 60));
+        session.mouse_ready = true;
+        assert!(session.accepts_mouse());
+        assert!(!interaction.update_hover((50, 60), Some(3)));
+        assert!(interaction.update_hover((51, 60), Some(3)));
+    }
+
+    #[test]
+    fn reset_during_icon_query_prevents_old_overlay_publication_and_paint() {
+        let epoch = crate::session::InputSessionEpoch::new();
+        let token = epoch.capture();
+        let mut selection = Some(1);
+        let mut paints = 0;
+        // Simulate WM_GETICON pumping lock+unlock while the first overlay builds.
+        epoch.invalidate();
+        selection.take();
+        epoch.invalidate();
+        let published = token.run_if_current(|| selection = Some(2));
+        token.run_if_current(|| paints += 1);
+        assert!(published.is_none());
+        assert_eq!(selection, None);
+        assert_eq!(paints, 0);
+        assert!(!token.is_current());
+        assert!(epoch
+            .capture()
+            .run_if_current(|| selection = Some(3))
+            .is_some());
+        assert_eq!(selection, Some(3));
+    }
+
+    #[test]
+    fn reset_during_window_enumeration_prevents_old_cache_and_activation() {
+        let epoch = crate::session::InputSessionEpoch::new();
+        let token = epoch.capture();
+        let mut state = SwitchWindowsState {
+            cache: Some(("old".into(), HWND::default(), 0, vec![1, 2])),
+            modifier_released: false,
+        };
+        let mut activated = None;
+        // Simulate a stale-modifier reset while enumeration pumps messages.
+        epoch.invalidate();
+        state.reset();
+        token.run_if_current(|| {
+            state.cache = Some(("candidate".into(), HWND::default(), 1, vec![1, 2]));
+            state.modifier_released = false;
+        });
+        token.run_if_current(|| activated = Some(2));
+        assert!(state.cache.is_none());
+        assert!(state.modifier_released);
+        assert_eq!(activated, None);
+    }
+
+    #[test]
+    fn reset_after_publication_still_prevents_paint_or_activation() {
+        let epoch = crate::session::InputSessionEpoch::new();
+        let token = epoch.capture();
+        assert_eq!(token.run_if_current(|| 1), Some(1));
+        epoch.invalidate();
+        assert_eq!(token.run_if_current(|| "paint"), None);
+        assert_eq!(token.run_if_current(|| "activate"), None);
+    }
+
+    #[test]
+    fn session_reset_clears_temporary_window_cycle() {
+        let mut state = SwitchWindowsState {
+            cache: Some(("test".into(), HWND::default(), 1, vec![1, 2])),
+            modifier_released: false,
+        };
+        state.reset();
+        assert!(state.cache.is_none());
+        assert!(state.modifier_released);
+    }
+
+    #[test]
     fn app_switch_interaction_starts_without_hover() {
         let state = SwitchAppsInteractionState::new(1, (10, 20));
 
@@ -859,26 +1699,26 @@ mod tests {
     }
 
     #[test]
-    fn app_switch_hover_changes_display_without_changing_keyboard_index() {
+    fn app_switch_hover_updates_keyboard_selection() {
         let mut state = SwitchAppsInteractionState::new(1, (10, 20));
 
         assert!(state.update_hover((11, 20), Some(4)));
-        assert_eq!(state.keyboard_index(), 1);
+        assert_eq!(state.keyboard_index(), 4);
         assert_eq!(state.hovered_index(), Some(4));
         assert_eq!(state.displayed_index(), 4);
         assert!(!state.update_hover((11, 20), Some(2)));
     }
 
     #[test]
-    fn app_switch_forward_navigation_continues_from_keyboard_index() {
+    fn app_switch_forward_navigation_continues_from_hovered_selection() {
         let mut state = SwitchAppsInteractionState::new(1, (10, 20));
         state.update_hover((11, 20), Some(4));
 
         state.navigate(5, false, (11, 20));
 
-        assert_eq!(state.keyboard_index(), 2);
+        assert_eq!(state.keyboard_index(), 0);
         assert_eq!(state.hovered_index(), None);
-        assert_eq!(state.displayed_index(), 2);
+        assert_eq!(state.displayed_index(), 0);
     }
 
     #[test]
@@ -887,8 +1727,9 @@ mod tests {
         state.update_hover((11, 20), Some(4));
         state.navigate(5, false, (11, 20));
 
+        assert_eq!(state.keyboard_index(), 0);
         assert!(state.update_hover((12, 20), Some(4)));
-        assert_eq!(state.keyboard_index(), 2);
+        assert_eq!(state.keyboard_index(), 4);
         assert_eq!(state.hovered_index(), Some(4));
         assert_eq!(state.displayed_index(), 4);
     }
@@ -900,41 +1741,53 @@ mod tests {
 
         state.navigate(5, false, (30, 40));
 
-        assert_eq!(state.keyboard_index(), 2);
+        assert_eq!(state.keyboard_index(), 0);
         assert_eq!(state.hovered_index(), None);
         assert!(!state.update_hover((30, 40), Some(4)));
+        assert_eq!(state.keyboard_index(), 0);
     }
 
     #[test]
-    fn app_switch_reverse_navigation_wraps_from_keyboard_index() {
+    fn app_switch_reverse_navigation_continues_from_hovered_selection() {
         let mut state = SwitchAppsInteractionState::new(0, (10, 20));
         state.update_hover((11, 20), Some(2));
 
         state.navigate(4, true, (11, 20));
 
-        assert_eq!(state.keyboard_index(), 3);
+        assert_eq!(state.keyboard_index(), 1);
         assert_eq!(state.hovered_index(), None);
-        assert_eq!(state.displayed_index(), 3);
+        assert_eq!(state.displayed_index(), 1);
     }
 
     #[test]
-    fn app_switch_modifier_release_keeps_keyboard_target_while_hovered() {
+    fn app_switch_modifier_release_uses_hovered_target() {
         let mut state = SwitchAppsInteractionState::new(1, (10, 20));
         state.update_hover((11, 20), Some(3));
 
-        assert_eq!(state.keyboard_index(), 1);
+        assert_eq!(state.keyboard_index(), 3);
     }
 
     #[test]
-    fn app_switch_mouse_leave_clears_hover_without_changing_keyboard_index() {
+    fn app_switch_mouse_leave_keeps_last_hovered_selection() {
         let mut state = SwitchAppsInteractionState::new(1, (10, 20));
         state.update_hover((11, 20), Some(3));
 
         assert!(state.clear_hover());
-        assert_eq!(state.keyboard_index(), 1);
+        assert_eq!(state.keyboard_index(), 3);
         assert_eq!(state.hovered_index(), None);
-        assert_eq!(state.displayed_index(), 1);
+        assert_eq!(state.displayed_index(), 3);
         assert!(!state.clear_hover());
+    }
+
+    #[test]
+    fn app_switch_pointer_moving_to_blank_keeps_last_hovered_selection() {
+        let mut state = SwitchAppsInteractionState::new(1, (10, 20));
+        state.update_hover((11, 20), Some(3));
+
+        assert!(state.update_hover((12, 20), None));
+        assert_eq!(state.keyboard_index(), 3);
+        assert_eq!(state.hovered_index(), None);
+        assert_eq!(state.displayed_index(), 3);
     }
 
     #[test]

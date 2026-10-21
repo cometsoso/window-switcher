@@ -24,6 +24,7 @@ pub struct Config {
     pub switch_windows_ignore_minimal: bool,
     switch_windows_only_current_desktop: Option<bool>,
     pub switch_apps_enable: bool,
+    pub switch_apps_ui_delay_ms: u32,
     pub switch_apps_hotkey: Vec<Hotkey>,
     pub switch_apps_ignore_minimal: bool,
     pub switch_apps_override_icons: IndexMap<String, String>,
@@ -47,6 +48,7 @@ impl Default for Config {
             switch_windows_ignore_minimal: false,
             switch_windows_only_current_desktop: None,
             switch_apps_enable: false,
+            switch_apps_ui_delay_ms: 150,
             switch_apps_hotkey: vec![Hotkey::create(
                 SWITCH_APPS_HOTKEY_ID,
                 "switch apps",
@@ -118,6 +120,15 @@ impl Config {
             }
         }
         if let Some(section) = ini_conf.section(Some("switch-apps")) {
+            // Windows timers accept at most USER_TIMER_MAXIMUM (0x7fffffff).
+            // Invalid values follow the other optional settings: keep the default.
+            if let Some(v) = section
+                .get("ui_delay_ms")
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|v| *v <= i32::MAX as u32)
+            {
+                conf.switch_apps_ui_delay_ms = v;
+            }
             if let Some(v) = section.get("enable").and_then(Config::to_bool) {
                 conf.switch_apps_enable = v;
             }
@@ -390,6 +401,32 @@ fn parse_hotkeys(id: u32, name: &str, value: &str) -> Result<Vec<Hotkey>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_ui_delay_defaults_parses_and_rejects_invalid_values() {
+        assert_eq!(Config::default().switch_apps_ui_delay_ms, 150);
+        assert_eq!(
+            Config::load(&Ini::new()).unwrap().switch_apps_ui_delay_ms,
+            150
+        );
+        for (value, expected) in [
+            ("0", 0),
+            ("250", 250),
+            ("2147483647", 2147483647),
+            ("2147483648", 150),
+            ("-1", 150),
+            ("abc", 150),
+            ("", 150),
+        ] {
+            let ini = Ini::load_from_str(&format!("[switch-apps]\nui_delay_ms = {value}")).unwrap();
+            assert_eq!(
+                Config::load(&ini).unwrap().switch_apps_ui_delay_ms,
+                expected
+            );
+        }
+        let ini = Ini::load_from_str(DEFAULT_CONFIG).unwrap();
+        assert_eq!(Config::load(&ini).unwrap().switch_apps_ui_delay_ms, 150);
+    }
 
     #[test]
     fn test_hotkey() {
