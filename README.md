@@ -68,6 +68,9 @@ enable = no
 # Hotkey to switch apps
 hotkey = alt+tab
 
+# Delay before showing the app-switcher UI, milliseconds (0 = immediate)
+ui_delay_ms = 150
+
 # Ignore minimal windows
 ignore_minimal = no
 
@@ -76,6 +79,8 @@ only_current_desktop = auto
 ```
 
 `fixed_order` accepts comma-separated executable file names, such as `Code.exe,notepad.exe`. Matching is case-insensitive, and full paths are not supported. It affects same-application window switching only, not `Alt+Tab`. For each listed process, Window-Switcher establishes the order from the order in which it first observes windows during its current run. Newly observed windows append to the order, and windows that are closed then reopened append at the end. This provides a stable, taskbar-like approximation; it does not read the real Windows 11 taskbar order. Restart Window-Switcher after changing the configuration.
+
+`[switch-apps] ui_delay_ms` (default `150`, range `0..2147483647`) delays only the UI, measured from the first hotkey, not from completion of icon loading. Releasing the modifier before it appears switches directly without flashing the UI. Holding it shows the current selection; another main-key press (including Shift/repeat) or an arrow shows it immediately and navigates. Escape cancels. Each new switch starts a fresh delay. Set `0` for immediate display; invalid values use `150`. Very small nonzero delays are subject to Windows timer resolution. Restart after changing this setting.
 
 ## Running as Administrator (Optional)
 
