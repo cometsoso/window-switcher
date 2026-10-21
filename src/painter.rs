@@ -132,7 +132,7 @@ fn make_surface_opaque(bits: *mut u8, width: i32, height: i32) {
     }
     unsafe {
         let pixels = std::slice::from_raw_parts_mut(bits, (width * height * 4) as usize);
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel[3] = u8::MAX;
         }
     }

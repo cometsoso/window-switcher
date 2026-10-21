@@ -554,7 +554,7 @@ fn ico_frame_dimensions(data: &[u8]) -> Option<Vec<(i32, i32)>> {
     let directory_len = count.checked_mul(16)?.checked_add(6)?;
     let directory = data.get(6..directory_len)?;
     let mut dimensions = Vec::with_capacity(count);
-    for entry in directory.chunks_exact(16) {
+    for entry in directory.as_chunks::<16>().0 {
         let width = if entry[0] == 0 {
             256
         } else {
@@ -651,7 +651,7 @@ const PIXEL_FORMAT_32BPP_ARGB: i32 = 0x26200a;
 const PIXEL_FORMAT_32BPP_PARGB: i32 = 0x0e200b;
 
 fn clear_fully_transparent_rgb(pixels: &mut [u8]) {
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         if pixel[3] == 0 {
             pixel[..3].fill(0);
         }
@@ -659,7 +659,7 @@ fn clear_fully_transparent_rgb(pixels: &mut [u8]) {
 }
 
 fn premultiply_alpha(pixels: &mut [u8]) {
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         let alpha = u16::from(pixel[3]);
         for channel in &mut pixel[..3] {
             *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
@@ -738,7 +738,9 @@ fn select_bounds(
     pixels: &[u8],
 ) -> PixelBounds {
     let alpha_has_semi_transparent = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .any(|pixel| pixel[3] > ALPHA_THRESHOLD && pixel[3] < u8::MAX);
     alpha
         .filter(|bounds| !bounds.is_full() || alpha_has_semi_transparent)
@@ -821,8 +823,10 @@ fn monochrome_mask_visibility(width: i32, height: i32, pixels: &[u8]) -> Option<
     let (and_mask, xor_mask) = pixels.split_at(half_len);
     Some(
         and_mask
-            .chunks_exact(4)
-            .zip(xor_mask.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(xor_mask.as_chunks::<4>().0)
             .map(|(and_pixel, xor_pixel)| {
                 let and_is_set = and_pixel[..3].iter().any(|channel| *channel != 0);
                 let xor_is_set = xor_pixel[..3].iter().any(|channel| *channel != 0);
@@ -1174,7 +1178,7 @@ fn get_icon_bounds(hicon: HICON) -> Option<IconBounds> {
         }
 
         let alpha_bounds = alpha_bounds(width, height, &pixels);
-        let has_semi_transparent = pixels.chunks_exact(4).any(|pixel| {
+        let has_semi_transparent = pixels.as_chunks::<4>().0.iter().any(|pixel| {
             let alpha = pixel[3];
             alpha > ALPHA_THRESHOLD && alpha < 255
         });
@@ -1198,7 +1202,9 @@ fn get_icon_bounds(hicon: HICON) -> Option<IconBounds> {
             )
         {
             let visible = pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| c[0] == 0 && c[1] == 0 && c[2] == 0)
                 .collect::<Vec<_>>();
             if let Some(bounds) = mask_bounds(width, height, &visible) {
@@ -1227,8 +1233,9 @@ fn get_icon_bounds(hicon: HICON) -> Option<IconBounds> {
 #[cfg(test)]
 mod tests {
     use super::{
-        alpha_bounds, get_icon_bounds, ico_frame_dimensions, mask_bounds, normalized_rect,
-        premultiply_alpha, select_bounds, AppIcon, PixelBounds, HICON,
+        alpha_bounds, clear_fully_transparent_rgb, get_icon_bounds, ico_frame_dimensions,
+        mask_bounds, normalized_rect, premultiply_alpha, select_bounds, AppIcon, PixelBounds,
+        HICON,
     };
 
     #[test]
@@ -1302,6 +1309,22 @@ mod tests {
         premultiply_alpha(&mut pixels);
 
         assert_eq!(pixels, [0, 0, 0, 0, 0x20, 0x40, 0x80, 128]);
+    }
+
+    #[test]
+    fn pixel_transforms_ignore_incomplete_trailing_pixels() {
+        for tail_len in 1..4 {
+            let mut pixels = vec![0x10, 0x20, 0x30, 0, 0x40, 0x80, 0xff, 128];
+            pixels.extend_from_slice(&[0x11, 0x22, 0x33][..tail_len]);
+
+            clear_fully_transparent_rgb(&mut pixels);
+            assert_eq!(&pixels[..8], &[0, 0, 0, 0, 0x40, 0x80, 0xff, 128]);
+            assert_eq!(&pixels[8..], &[0x11, 0x22, 0x33][..tail_len]);
+
+            premultiply_alpha(&mut pixels);
+            assert_eq!(&pixels[..8], &[0, 0, 0, 0, 0x20, 0x40, 0x80, 128]);
+            assert_eq!(&pixels[8..], &[0x11, 0x22, 0x33][..tail_len]);
+        }
     }
 
     #[test]
